@@ -1,0 +1,28 @@
+# Web Framework & Server
+fastapi
+uvicorn
+python-multipart
+pydantic
+python-dotenv
+nest_asyncio
+pyngrok
+requests
+
+# AI Models & Processing
+torch
+transformers
+accelerate
+sentence-transformers
+Pillow
+
+# RAG & Vector Database
+langchain
+langchain-community
+langchain-huggingface
+faiss-cpu
+beautifulsoup4
+
+# Document Loaders & OCR
+pypdf
+PyPDF2
+pytesseract

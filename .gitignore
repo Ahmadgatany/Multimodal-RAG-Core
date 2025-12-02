@@ -1,0 +1,19 @@
+# ----------------------------------
+# Python & Virtual Environment
+# ----------------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv/
+env/
+pip-log.txt
+
+/tmp/
+*.log
+
+*.faiss
+*.index
+index/
+vector_store/
