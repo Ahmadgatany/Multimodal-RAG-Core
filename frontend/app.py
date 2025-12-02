@@ -44,7 +44,7 @@ st.markdown(
 # ------------------------------
 #        Main Title
 # ------------------------------
-st.markdown('<div class="main-title">🤖 RAG – Streamlit Client</div>', unsafe_allow_html=True)
+st.markdown('<div class="main-title">🤖 Multimodal-RAG-Core</div>', unsafe_allow_html=True)
 st.write("نظام للتفاعل مع API يعمل من خلال ngrok (Kaggle Notebook).")
 
 # ------------------------------
