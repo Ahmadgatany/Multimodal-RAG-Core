@@ -1,5 +1,4 @@
 
-````markdown
 # Multimodal RAG Core
 
 ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/Ahmadgatany/Multimodal-RAG-Core/main?style=flat-square)
@@ -44,7 +43,7 @@ Before installing Python packages, ensure the following system dependencies (req
 ```bash
 # Run this in your Kaggle/Colab Notebook environment:
 !apt-get update && apt-get install -y tesseract-ocr poppler-utils
-````
+```
 
 #### B. Python Dependencies
 
