@@ -101,15 +101,17 @@ Open the Streamlit URL in your browser, paste the Ngrok public URL obtained from
 
 ## 📸 Usage Screenshots
 
-*(Please replace the following placeholders with actual screenshots of your running Streamlit application)*
+### 1. Main Interface
+The clean Streamlit interface ready for multimodal interaction.
+![Main Interface](assets/ui_overview.png)
 
-### Main Chat Interface
+### 2. Image Understanding (Vision)
+The model analyzing an uploaded image and answering questions about its content.
+![Vision Example](assets/vision_demo.png)
 
-### File Upload and Summarization
-
-### Image Q\&A Example
-
-[Image showing an attached image in the chat and the model answering a question about it]
+### 3. Document RAG
+Extracting information from an uploaded PDF file using the RAG pipeline.
+![RAG Example](assets/doc_rag_demo.png)
 
 -----
 
