@@ -4,9 +4,10 @@ uvicorn
 python-multipart
 pydantic
 python-dotenv
-nest_asyncio
-pyngrok
 requests
+PyJWT
+redis
+psycopg[binary]
 
 # AI Models & Processing
 torch
@@ -14,6 +15,7 @@ transformers
 accelerate
 sentence-transformers
 Pillow
+google-genai
 
 # RAG & Vector Database
 langchain

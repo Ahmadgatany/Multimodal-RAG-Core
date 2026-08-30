@@ -1,18 +1,22 @@
 import os
-import torch
+import sqlite3
 from typing import Optional, List, Dict
 from pathlib import Path
 from PIL import Image
 
-# --- Transformers ---
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM, 
-    AutoProcessor, 
-    AutoModelForVision2Seq, 
-    pipeline
-)
+try:
+    import torch
+except ImportError:
+    torch = None
 
+try:
+    from .config import DB_PATH, EMBEDDING_MODEL, GOOGLE_API_KEY, GOOGLE_MODEL, LLM_PROVIDER, OPENROUTER_API_KEY, OPENROUTER_APP_NAME, OPENROUTER_MODEL, OPENROUTER_SITE_URL, UPLOAD_DIR, USE_VECTOR_DB
+    from .llm_provider import GeminiProvider, OpenRouterProvider
+except ImportError:
+    from config import DB_PATH, EMBEDDING_MODEL, GOOGLE_API_KEY, GOOGLE_MODEL, LLM_PROVIDER, OPENROUTER_API_KEY, OPENROUTER_APP_NAME, OPENROUTER_MODEL, OPENROUTER_SITE_URL, UPLOAD_DIR, USE_VECTOR_DB
+    from llm_provider import GeminiProvider, OpenRouterProvider
+
+# --- Transformers ---
 # -------------------
 try:
     from langchain_community.vectorstores import FAISS
@@ -47,15 +51,18 @@ class RAGCore:
         embedding_model: Optional[str] = None,
         device: Optional[str] = None,
         upload_dir: Optional[str] = None,
+        db_path: Optional[str] = None,
         use_vector_db: Optional[bool] = None,
     ):
         # Defaults (fall back to env or sane defaults)
         self.model_id = model_id or os.getenv("HF_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
-        self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2")
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.upload_dir = Path(upload_dir or os.getenv("UPLOAD_DIR", "/tmp/agentic_uploads"))
+        self.embedding_model = embedding_model or EMBEDDING_MODEL
+        self.device = device or ("cuda" if torch is not None and torch.cuda.is_available() else "cpu")
+        self.upload_dir = Path(upload_dir or UPLOAD_DIR)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
-        self.use_vector_db = use_vector_db if use_vector_db is not None else os.getenv("USE_VECTOR_DB", "True").lower() in ("1","true","yes")
+        self.db_path = Path(db_path or os.getenv("DB_PATH", str(DB_PATH)))
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.use_vector_db = use_vector_db if use_vector_db is not None else USE_VECTOR_DB
 
         # Model placeholders
         self.tokenizer = None
@@ -63,9 +70,12 @@ class RAGCore:
         self.processor = None     # for VL models
         self.text_gen = None      # pipeline for text-only models
         self.model_is_vl = False
+        self.provider = None
 
         # Document storage: list of dicts { "source": str, "text": str }
         self.docs: List[Dict[str, str]] = []
+        self._init_storage()
+        self.docs = self._load_docs()
 
         # Vector DB placeholder
         self.vector_db = None
@@ -84,8 +94,45 @@ class RAGCore:
         except Exception:
             self._ocr_available = False
 
-        # load model (may raise informative errors)
-        self._load_model()
+        if LLM_PROVIDER == "google":
+            self.provider = GeminiProvider(GOOGLE_API_KEY, GOOGLE_MODEL)
+        elif LLM_PROVIDER == "openrouter":
+            self.provider = OpenRouterProvider(
+                OPENROUTER_API_KEY,
+                OPENROUTER_MODEL,
+                OPENROUTER_SITE_URL,
+                OPENROUTER_APP_NAME,
+            )
+        else:
+            self._load_model()
+
+    def _init_storage(self):
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS documents ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, "
+                "text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+            )
+
+    def _load_docs(self) -> List[Dict[str, str]]:
+        with sqlite3.connect(self.db_path) as connection:
+            rows = connection.execute("SELECT source, text FROM documents ORDER BY id").fetchall()
+        return [{"source": source, "text": text} for source, text in rows]
+
+    def _add_doc(self, source: str, text: str):
+        if not text.strip():
+            return
+        document = {"source": source, "text": text}
+        self.docs.append(document)
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "INSERT INTO documents (source, text) VALUES (?, ?)",
+                (source, text),
+            )
+
+    def add_text(self, text_path: str):
+        text = Path(text_path).read_text(encoding="utf-8", errors="ignore")
+        self._add_doc(text_path, text)
 
     def _get_model_device(self):
         try:
@@ -199,7 +246,7 @@ class RAGCore:
                 loader = PyPDFLoader(str(pdf_path))
                 pages = loader.load()
                 for pg in pages:
-                    self.docs.append({"source": str(pdf_path), "text": pg.page_content})
+                    self._add_doc(str(pdf_path), pg.page_content)
                 return
             except Exception:
                 # fallback to PyPDF2 below
@@ -212,7 +259,7 @@ class RAGCore:
             for page in reader.pages:
                 txt = page.extract_text() or ""
                 if txt.strip():
-                    self.docs.append({"source": str(pdf_path), "text": txt})
+                    self._add_doc(str(pdf_path), txt)
             return
         except Exception as e:
             raise RuntimeError(f"Failed to extract text from PDF: {e}") from e
@@ -234,7 +281,7 @@ class RAGCore:
         if not extracted:
             # store a small placeholder hint so that user knows image exists
             extracted = f"[no OCR text] Image saved at: {img_path}"
-        self.docs.append({"source": str(img_path), "text": extracted})
+        self._add_doc(str(img_path), extracted)
 
     # ---------------- Vector DB ----------------
     def build_vector_db(self, chunk_size: int = 1000, chunk_overlap: int = 100):
@@ -304,6 +351,15 @@ class RAGCore:
         Generate text handling Chat Templates correctly to avoid repetition.
         messages example: [{"role": "user", "content": "Hello..."}]
         """
+        if self.provider is not None:
+            if isinstance(messages, str):
+                prompt = messages
+            else:
+                prompt = "\n\n".join(
+                    f"{message['role'].upper()}: {message['content']}" for message in messages
+                )
+            return self.provider.generate(prompt, image=image, max_output_tokens=max_new_tokens)
+
         # 1. Prepare inputs using Chat Template
         text_prompt = self.processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -366,7 +422,7 @@ class RAGCore:
                 except:
                     context = "\n\n".join(d["text"] for d in self.docs)
             else:
-                 pass
+                context = self.get_local_content(question, k=k)
         
         if context:
             system_msg = "You are a helpful assistant. Answer based strictly on the provided context."

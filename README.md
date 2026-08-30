@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/github/license/Ahmadgatany/Multimodal-RAG-Core?style=flat-square)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 
-A Multimodal RAG System powered by the **Qwen2.5-VL-7B-Instruct** model. This project enables seamless interaction and querying with unstructured data, including **PDFs, Images, and raw Text**, using a hybrid cloud-local architecture built with FastAPI and Streamlit.
+A Multimodal RAG System with a provider-independent FastAPI backend and Streamlit client. The default provider is OpenRouter, configured for `minimax/minimax-m3:free`; Google Gemini and Hugging Face remain available as alternatives.
 
 ---
 
@@ -14,8 +14,8 @@ A Multimodal RAG System powered by the **Qwen2.5-VL-7B-Instruct** model. This pr
 * **Multimodal Q&A:** Answer questions based on uploaded images (Vision-Language).
 * **Document RAG:** Context-aware answers and summarization from PDFs and text files using LangChain and FAISS.
 * **OCR Integration:** Extract text from images and documents to enhance retrieval accuracy.
-* **Dual Architecture:** Decouples the GPU-intensive backend (Kaggle/Colab) from the lightweight frontend (Local Streamlit).
-* **Dynamic Connectivity:** Uses **Ngrok** to establish a secure tunnel from the cloud backend to the local client.
+* **Provider boundary:** Switch model providers through environment variables without changing the RAG API.
+* **Local client connection:** Streamlit connects directly to the local FastAPI service; set `RAG_API_URL` only when the API runs elsewhere.
 
 ## 📐 Project Architecture
 
@@ -24,54 +24,45 @@ This project employs a client-server architecture designed to leverage cloud GPU
 | Component | Technology | Role | Location |
 | :--- | :--- | :--- | :--- |
 | **Backend** (Server) | FastAPI, Qwen-VL, PyTorch, FAISS | Handles file ingestion, RAG pipeline, LLM inference, and summarization. | **Cloud (Kaggle/Colab GPU)** |
-| **Frontend** (Client) | Streamlit, Requests | Provides the interactive chat interface, file upload, and connects to the public Ngrok URL. | **Local Machine** |
-| **Bridge** | Ngrok | Creates a publicly accessible HTTPS endpoint for the FastAPI server. | Cloud |
-| **Core Model** | Qwen/Qwen2.5-VL-7B-Instruct | Vision-Language Model used for generation and multimodal understanding. | Cloud |
+| **Frontend** (Client) | Streamlit, Requests | Provides the interactive chat interface and connects directly to the local FastAPI service. | **Local Machine** |
+| **Core Model** | Google Gemini (configurable) | Vision-Language Model used for generation and multimodal understanding. | Google API |
 
 ---
 
 ## 🛠️ Setup and Installation
 
-### 1. Backend Setup (Kaggle Notebook or Colab)
+### 1. Backend Setup
 
-The backend handles the model loading and runs the FastAPI server.
+The backend handles ingestion, retrieval, and model requests. OpenRouter does not require a local GPU.
 
-#### A. System Dependencies
+#### A. Install dependencies
 
-Before installing Python packages, ensure the following system dependencies (required for PDF and OCR processing) are installed:
-
-```bash
-# Run this in your Kaggle/Colab Notebook environment:
-!apt-get update && apt-get install -y tesseract-ocr poppler-utils
-```
-
-#### B. Python Dependencies
-
-Install the necessary Python libraries for the backend logic:
+Install the backend dependencies:
 
 ```bash
 cd backend
 pip install -r requirements.txt
 ```
 
-#### C. Configuration
+#### B. Configuration
 
-Create a file named `.env` inside the `backend/` directory and add your Ngrok Authentication Token (required to expose the FastAPI server):
+Create `backend/.env` and add an OpenRouter API key. Keep this file private:
 
 ```dotenv
-# .env file content
-NGROK_TOKEN="YOUR_NGROK_AUTH_TOKEN_HERE"
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY_HERE"
+OPENROUTER_MODEL=minimax/minimax-m3:free
 ```
 
 #### D. Execution
 
-Run the FastAPI application. This script will automatically connect to Ngrok and print the public URL.
+From the project root, start the backend and frontend together with one command:
 
-```bash
-python app.py
+```powershell
+python run.py
 ```
 
-**IMPORTANT:** Note the generated public URL (e.g., `https://xxxx-xxxx-xxxx.ngrok-free.app`). You will need this for the frontend setup.
+The local API is available at `http://localhost:8000` and Streamlit at `http://localhost:8501`. Press `Ctrl+C` once to stop both services. Production deployments should use a process manager or containers, authentication, rate limiting, and persistent storage.
 
 ### 2\. Frontend Setup (Local Machine)
 
@@ -88,13 +79,7 @@ pip install -r requirements.txt
 
 #### B. Execution
 
-Start the Streamlit application:
-
-```bash
-streamlit run app.py
-```
-
-Open the Streamlit URL in your browser, paste the Ngrok public URL obtained from the backend execution, and start interacting with your multimodal agent\!
+The launcher starts Streamlit automatically. It connects to `http://localhost:8000` without asking for a server URL. To use another API host, set `RAG_API_URL` before starting Streamlit.
 
 -----
 
