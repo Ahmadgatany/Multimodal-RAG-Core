@@ -87,24 +87,6 @@ pip install -r requirements.txt
 
 The launcher starts Streamlit automatically. It connects to `http://localhost:8000` without asking for a server URL. To use another API host, set `RAG_API_URL` before starting Streamlit.
 
------
-
-## 📸 Usage Screenshots
-
-### 1. Main Interface
-The clean Streamlit interface ready for multimodal interaction.
-![Main Interface](assets/ui_overview.png)
-
-### 2. Image Understanding (Vision)
-The model analyzing an uploaded image and answering questions about its content.
-![Vision Example](assets/vision_demo.png)
-
-### 3. Document RAG
-Extracting information from an uploaded PDF file using the RAG pipeline.
-![RAG Example](assets/doc_rag_demo.png)
-
------
-
 ## 🤝 Contribution
 
 Feel free to open issues or submit pull requests. All feedback is welcome\!
