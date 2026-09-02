@@ -113,10 +113,37 @@ def upload_file_to_backend(file_obj, conversation_id):
             st.session_state.last_uploaded = file_obj.name
             st.session_state.upload_jobs[payload.get("document_id")] = {"filename": file_obj.name, "status": payload.get("status", "uploaded")}
             st.toast(f"Uploaded: {file_obj.name}", icon="✅")
+            return payload.get("document_id")
         else:
             st.warning(f"{file_obj.name}: {response.text}")
     except requests.RequestException:
         st.error("Upload failed: backend unavailable")
+    return None
+
+
+def wait_for_upload(document_id, conversation_id, timeout=120):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            response = api_request(
+                "GET",
+                f"/documents/{document_id}",
+                params={"conversation_id": conversation_id},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                job = response.json()
+                st.session_state.upload_jobs[document_id] = job
+                if job.get("status") == "ready":
+                    return True
+                if job.get("status") == "failed":
+                    st.error(f"{job.get('filename', 'File')}: {job.get('detail', 'Processing failed')}")
+                    return False
+        except requests.RequestException:
+            pass
+        time.sleep(1)
+    st.error("The uploaded file is still processing. Please try again shortly.")
+    return False
 
 
 def refresh_upload_jobs():
@@ -646,9 +673,14 @@ else:
                 title = prompt.strip()[:40] if prompt.strip() else "New chat"
                 cid = save_chat_message("user", prompt.strip(), st.session_state.get("conversation_id"), title=title)
                 st.session_state.conversation_id = cid or st.session_state.get("conversation_id")
+                upload_ready = True
                 if is_doc and uploaded_file.file_id not in st.session_state.uploaded_file_ids:
-                    upload_file_to_backend(uploaded_file, st.session_state.conversation_id)
+                    document_id = upload_file_to_backend(uploaded_file, st.session_state.conversation_id)
                     st.session_state.uploaded_file_ids.add(uploaded_file.file_id)
+                    upload_ready = bool(document_id) and wait_for_upload(document_id, st.session_state.conversation_id)
+
+                if not upload_ready:
+                    st.stop()
 
                 try:
                     with st.spinner("Processing..."):
