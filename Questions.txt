@@ -1,0 +1,13 @@
+What is the full link written in this image?
+
+Name three skills that Ahmed possesses.
+
+
+
+Summarize the following text in a clear and concise way, capturing the main ideas only:
+
+Artificial Intelligence (AI) has rapidly evolved in recent years, transforming industries and reshaping the way people work and interact with technology. Modern AI systems are now capable of understanding natural language, recognizing images, making predictions, and even generating human-like responses.
+Despite their impressive capabilities, AI models still face challenges such as limited contextual understanding, reliance on large datasets, and potential biases in decision-making.
+As research continues, the future of AI is expected to bring more advanced reasoning, safer deployment practices, and systems that can learn efficiently with less data. These improvements will enable AI to support fields such as healthcare, education, transportation, and scientific research more effectively.
+
+

@@ -1,9 +1,6 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: multimodal_rag_postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: multimodal_rag
@@ -12,14 +9,13 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d multimodal_rag"]
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
-    container_name: multimodal_rag_redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
@@ -34,7 +30,6 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    container_name: multimodal_rag_backend
     restart: unless-stopped
     depends_on:
       postgres:
@@ -43,23 +38,26 @@ services:
         condition: service_healthy
     environment:
       APP_ENV: production
-      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:?Set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/multimodal_rag
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/multimodal_rag
       REDIS_URL: redis://redis:6379/0
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
       PROVIDER_ENCRYPTION_KEY: ${PROVIDER_ENCRYPTION_KEY:?Set PROVIDER_ENCRYPTION_KEY in .env}
-      JWT_ALGORITHM: HS256
-      JWT_ACCESS_TOKEN_TTL_SECONDS: 3600
-      JWT_REFRESH_TOKEN_TTL_SECONDS: 604800
-      AUTH_BACKEND: jwt
-      LLM_PROVIDER: openrouter
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?Set OPENROUTER_API_KEY in .env}
-      OPENROUTER_MODEL: minimax/minimax-m3:free
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-minimax/minimax-m3:free}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?Set the public frontend origin in .env}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
       UPLOAD_DIR: /app/data/uploads
       DATA_DIR: /app/data
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     volumes:
       - app_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
 
 volumes:
   postgres_data:

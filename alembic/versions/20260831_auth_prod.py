@@ -56,8 +56,8 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(op.f("ix_revoked_tokens_id"), "revoked_tokens", ["id"], unique=False)
-    op.f("ix_revoked_tokens_jti")
-    op.f("ix_revoked_tokens_user_id")
+    op.create_index(op.f("ix_revoked_tokens_jti"), "revoked_tokens", ["jti"], unique=True)
+    op.create_index(op.f("ix_revoked_tokens_user_id"), "revoked_tokens", ["user_id"], unique=False)
 
 
 def downgrade() -> None:

@@ -1,11 +1,15 @@
 import json
+import logging
 import time
 from collections import OrderedDict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from threading import Lock
 from typing import Any, Optional
-from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
+from fastapi import BackgroundTasks, FastAPI, Request, UploadFile, File, Form, Header, HTTPException, Query, status
+from fastapi.middleware.cors import CORSMiddleware
 from io import BytesIO
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pathlib import Path
 import uvicorn
 from PIL import Image
@@ -15,6 +19,7 @@ import secrets
 import sqlite3
 
 import jwt
+from sqlalchemy import text
 
 try:
     from .database import Base, SessionLocal, engine
@@ -35,52 +40,72 @@ except ImportError:  # pragma: no cover
 try:
     from .config import (
         AGENT_CACHE_SIZE,
+        ALLOWED_ORIGINS,
         ALLOWED_EXTENSIONS,
         AUTH_BACKEND,
+        AUTH_DB_PATH,
         CHAT_HISTORY_DB_PATH,
         CHAT_HISTORY_RETENTION_DAYS,
         DATABASE_URL,
         GOOGLE_MODEL,
         JWT_ACCESS_TOKEN_TTL_SECONDS,
         JWT_ALGORITHM,
+        JWT_REFRESH_TOKEN_TTL_SECONDS,
         JWT_SECRET_KEY,
         LLM_PROVIDER,
         MAX_ACTIVE_USERS,
+        MAX_FILES_PER_USER,
         MAX_UPLOAD_MB,
         OPENROUTER_MODEL,
         PROVIDER_SETTINGS_DB_PATH,
         REDIS_URL,
+        LOGIN_RATE_LIMIT,
+        CHAT_RATE_LIMIT,
+        UPLOAD_RATE_LIMIT,
+        RATE_LIMIT_WINDOW_SECONDS,
         SESSION_TTL_SECONDS,
         SUPPORTED_PROVIDERS,
         UPLOAD_DIR,
         USE_VECTOR_DB,
+        validate_runtime_configuration,
         get_provider_settings,
         get_runtime_provider_config,
+        save_provider_settings,
     )
 except ImportError:
     from config import (
         AGENT_CACHE_SIZE,
+        ALLOWED_ORIGINS,
         ALLOWED_EXTENSIONS,
         AUTH_BACKEND,
+        AUTH_DB_PATH,
         CHAT_HISTORY_DB_PATH,
         CHAT_HISTORY_RETENTION_DAYS,
         DATABASE_URL,
         GOOGLE_MODEL,
         JWT_ACCESS_TOKEN_TTL_SECONDS,
         JWT_ALGORITHM,
+        JWT_REFRESH_TOKEN_TTL_SECONDS,
         JWT_SECRET_KEY,
         LLM_PROVIDER,
         MAX_ACTIVE_USERS,
+        MAX_FILES_PER_USER,
         MAX_UPLOAD_MB,
         OPENROUTER_MODEL,
         PROVIDER_SETTINGS_DB_PATH,
         REDIS_URL,
+        LOGIN_RATE_LIMIT,
+        CHAT_RATE_LIMIT,
+        UPLOAD_RATE_LIMIT,
+        RATE_LIMIT_WINDOW_SECONDS,
         SESSION_TTL_SECONDS,
         SUPPORTED_PROVIDERS,
         UPLOAD_DIR,
         USE_VECTOR_DB,
+        validate_runtime_configuration,
         get_provider_settings,
         get_runtime_provider_config,
+        save_provider_settings,
     )
 
 try:
@@ -93,14 +118,26 @@ except ImportError:
 # ---------------- FastAPI App ----------------
 # ---------------------------------------------
 
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("multimodal_rag")
+
 app = FastAPI(title="Multimodal RAG API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 STORAGE_DIR = UPLOAD_DIR
-AUTH_DB_PATH = STORAGE_DIR.parent / "users.sqlite3"
-CHAT_HISTORY_DB_PATH = CHAT_HISTORY_DB_PATH
 PROVIDER_SETTINGS_DB_PATH = PROVIDER_SETTINGS_DB_PATH
-agents: "OrderedDict[str, RAGCore]" = OrderedDict()
+agents: "OrderedDict[tuple[str, str], RAGCore]" = OrderedDict()
 sessions: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
 revoked_tokens: "set[str]" = set()
+_rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
+_rate_limit_lock = Lock()
+_metrics_lock = Lock()
+_metrics: dict[str, Any] = {"requests": 0, "errors": 0, "response_ms_total": 0.0, "llm_requests": 0, "llm_by_provider": defaultdict(int)}
 
 if REDIS_URL and redis is not None:
     try:
@@ -114,6 +151,53 @@ else:
 
 def _redis_key(prefix: str, value: str) -> str:
     return f"{prefix}:{value}"
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", uuid4().hex)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.perf_counter() - started) * 1000
+        with _metrics_lock:
+            _metrics["requests"] += 1
+            _metrics["errors"] += 1
+            _metrics["response_ms_total"] += duration_ms
+        logger.exception(json.dumps({"event": "request_failed", "request_id": request_id, "path": request.url.path, "method": request.method, "duration_ms": round(duration_ms, 1)}))
+        raise
+    duration_ms = (time.perf_counter() - started) * 1000
+    with _metrics_lock:
+        _metrics["requests"] += 1
+        _metrics["response_ms_total"] += duration_ms
+        _metrics["errors"] += int(response.status_code >= 500)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Cache-Control"] = "no-store" if request.url.path.startswith(("/auth", "/settings", "/profile")) else "private"
+    response.headers["X-Request-ID"] = request_id
+    logger.info(json.dumps({"event": "request_completed", "request_id": request_id, "path": request.url.path, "method": request.method, "status": response.status_code, "duration_ms": round(duration_ms, 1)}))
+    return response
+
+
+def _enforce_rate_limit(scope: str, identifier: str, limit: int) -> None:
+    key = f"rate:{scope}:{identifier}"
+    if redis_client is not None:
+        count = redis_client.incr(key)
+        if count == 1:
+            redis_client.expire(key, RATE_LIMIT_WINDOW_SECONDS)
+        if count > limit:
+            raise HTTPException(429, "Too many requests. Please try again shortly.")
+        return
+    now = time.time()
+    with _rate_limit_lock:
+        events = _rate_limit_events[key]
+        while events and now - events[0] >= RATE_LIMIT_WINDOW_SECONDS:
+            events.popleft()
+        if len(events) >= limit:
+            raise HTTPException(429, "Too many requests. Please try again shortly.")
+        events.append(now)
 
 
 def hash_token_value(token: str) -> str:
@@ -344,6 +428,7 @@ def _init_chat_history_storage():
 
 
 def _prune_chat_history(now: Optional[float] = None):
+    _init_chat_history_storage()
     current_time = time.time() if now is None else now
     cutoff = current_time - (CHAT_HISTORY_RETENTION_DAYS * 86400)
     with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
@@ -449,34 +534,53 @@ def _touch_session(token: str) -> Optional[str]:
 
 
 class QueryRequest(BaseModel):
-    question: str
-    k: int = 5
+    question: str = Field(min_length=1, max_length=4000)
+    k: int = Field(default=5, ge=1, le=10)
+    conversation_id: str = Field(min_length=1)
 
 
 class Credentials(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=3, max_length=80)
+    password: str = Field(min_length=8, max_length=256)
+
+
+class ProviderSettingsRequest(BaseModel):
+    provider: str
+    api_key: str = ""
+    model_name: str = ""
+    enabled: bool = True
 
 
 def _init_auth_storage():
-    AUTH_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(AUTH_DB_PATH) as connection:
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS users ("
-            "id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL)"
-        )
+    _reset_sqlalchemy_schema_if_needed()
+    # Local development used an older SQLite schema before Alembic was added.
+    # Keep it upgradeable without compromising the PostgreSQL production path.
+    if engine is not None and engine.dialect.name == "sqlite":
+        with engine.begin() as connection:
+            columns = {row[1] for row in connection.exec_driver_sql("PRAGMA table_info(users)")}
+            if "created_at" not in columns:
+                connection.exec_driver_sql("ALTER TABLE users ADD COLUMN created_at DATETIME")
+            if "updated_at" not in columns:
+                connection.exec_driver_sql("ALTER TABLE users ADD COLUMN updated_at DATETIME")
 
 
 def _hash_password(password: str, salt: bytes | None = None) -> str:
     salt = salt or secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 120_000)
-    return f"{salt.hex()}${digest.hex()}"
+    digest = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return f"scrypt${salt.hex()}${digest.hex()}"
 
 
 def _verify_password(password: str, stored: str) -> bool:
-    salt_hex, digest_hex = stored.split("$", 1)
-    candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), 120_000)
-    return secrets.compare_digest(candidate.hex(), digest_hex)
+    try:
+        if stored.startswith("scrypt$"):
+            _, salt_hex, digest_hex = stored.split("$", 2)
+            candidate = hashlib.scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt_hex), n=2**14, r=8, p=1, dklen=32)
+        else:  # Legacy PBKDF2 hashes remain valid and are upgraded after login.
+            salt_hex, digest_hex = stored.split("$", 1)
+            candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), 120_000)
+        return secrets.compare_digest(candidate.hex(), digest_hex)
+    except (ValueError, TypeError):
+        return False
 
 
 def _current_user(authorization: Optional[str]) -> str:
@@ -499,10 +603,49 @@ def _current_user(authorization: Optional[str]) -> str:
     return user_id
 
 
-def _get_agent(user_id: str) -> RAGCore:
-    if user_id in agents:
-        agents.move_to_end(user_id)
-        return agents[user_id]
+def _require_user(user_id: str) -> User:
+    if SessionLocal is None or User is None:
+        raise HTTPException(503, "Authentication database is unavailable")
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise HTTPException(401, "User no longer exists")
+        db.expunge(user)
+        return user
+    finally:
+        db.close()
+
+
+def _conversation_exists(user_id: str, conversation_id: str) -> bool:
+    _init_chat_history_storage()
+    with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
+        return connection.execute(
+            "SELECT 1 FROM conversations WHERE id = ? AND user_id = ?",
+            (conversation_id, user_id),
+        ).fetchone() is not None
+
+
+def _get_agent(user_id: str, conversation_id: str) -> RAGCore:
+    key = (user_id, conversation_id)
+    if key in agents:
+        agents.move_to_end(key)
+        return agents[key]
+
+    while len(agents) >= AGENT_CACHE_SIZE:
+        _evict_oldest_agent()
+
+    conversation_dir = STORAGE_DIR / user_id / "conversations" / conversation_id
+    conversation_dir.mkdir(parents=True, exist_ok=True)
+    (conversation_dir / "uploads").mkdir(parents=True, exist_ok=True)
+    agent = RAGCore(
+        upload_dir=str(conversation_dir / "uploads"),
+        db_path=str(conversation_dir / "rag.sqlite3"),
+        user_id=user_id,
+    )
+    agents[key] = agent
+    agents.move_to_end(key)
+    return agent
 
     while len(agents) >= AGENT_CACHE_SIZE:
         _evict_oldest_agent()
@@ -510,13 +653,14 @@ def _get_agent(user_id: str) -> RAGCore:
     user_dir = STORAGE_DIR / user_id
     user_dir.mkdir(parents=True, exist_ok=True)
     (user_dir / "uploads").mkdir(parents=True, exist_ok=True)
-    agent = RAGCore(upload_dir=str(user_dir / "uploads"), db_path=str(user_dir / "rag.sqlite3"))
+    agent = RAGCore(upload_dir=str(user_dir / "uploads"), db_path=str(user_dir / "rag.sqlite3"), user_id=user_id)
     agents[user_id] = agent
     agents.move_to_end(user_id)
     return agent
 
 @app.on_event("startup")
 def startup_event():
+    validate_runtime_configuration()
     _init_auth_storage()
     _init_chat_history_storage()
     _reset_sqlalchemy_schema_if_needed()
@@ -524,33 +668,42 @@ def startup_event():
 
 
 @app.post("/auth/register")
-def register(credentials: Credentials):
+def register(credentials: Credentials, request: Request = None):
+    _enforce_rate_limit("register", request.client.host if request and request.client else "unknown", LOGIN_RATE_LIMIT)
     username = credentials.username.strip()
     if len(username) < 3 or len(credentials.password) < 6:
         raise HTTPException(400, "Username must have 3 characters and password 6 characters")
-    user_id = uuid4().hex
+    if SessionLocal is None or User is None:
+        raise HTTPException(503, "Authentication database is unavailable")
+    db = SessionLocal()
     try:
-        with sqlite3.connect(AUTH_DB_PATH) as connection:
-            connection.execute(
-                "INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)",
-                (user_id, username, _hash_password(credentials.password)),
-            )
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, "Username already exists")
+        if db.query(User).filter(User.username == username).first():
+            raise HTTPException(409, "Username already exists")
+        db.add(User(id=uuid4().hex, username=username, password_hash=_hash_password(credentials.password)))
+        db.commit()
+    finally:
+        db.close()
     return {"message": "Account created"}
 
 
 @app.post("/auth/login")
-def login(credentials: Credentials):
+def login(credentials: Credentials, request: Request = None):
+    _enforce_rate_limit("login", f"{request.client.host if request and request.client else 'unknown'}:{credentials.username.strip().lower()}", LOGIN_RATE_LIMIT)
     if User is not None and SessionLocal is not None:
         db = SessionLocal()
         try:
             user = db.query(User).filter(User.username == credentials.username.strip()).first()
             if not user or not _verify_password(credentials.password, user.password_hash):
                 raise HTTPException(401, "Invalid username or password")
+            if not user.password_hash.startswith("scrypt$"):
+                user.password_hash = _hash_password(credentials.password)
+                db.commit()
         finally:
             db.close()
 
+        _prune_sessions()
+        if len(sessions) >= MAX_ACTIVE_USERS:
+            raise HTTPException(429, f"Maximum active users reached ({MAX_ACTIVE_USERS}). Please retry in a moment.")
         access_token = create_access_token(user.id)
         refresh_token = create_refresh_token(user.id)
         _store_session_token(access_token, user.id)
@@ -624,28 +777,21 @@ def refresh_token(payload: dict[str, str]):
 
 
 @app.get("/settings/providers")
-def get_provider_settings_route():
-    return {"providers": get_provider_settings(), "supported": SUPPORTED_PROVIDERS, "active": LLM_PROVIDER}
+def get_provider_settings_route(authorization: Optional[str] = Header(None)):
+    user_id = _current_user(authorization)
+    return {"providers": get_provider_settings(user_id), "supported": SUPPORTED_PROVIDERS, "active": LLM_PROVIDER}
 
 
 @app.post("/settings/providers")
-def save_provider_settings(payload: dict[str, str]):
-    provider_name = (payload.get("provider") or "").strip().lower()
-    if not provider_name:
-        raise HTTPException(400, "provider is required")
-
-    api_key = (payload.get("api_key") or "").strip()
-    model_name = (payload.get("model_name") or "").strip()
-    enabled = bool(payload.get("enabled", True))
-
-    with sqlite3.connect(PROVIDER_SETTINGS_DB_PATH) as connection:
-        connection.execute(
-            "INSERT INTO provider_settings (provider, api_key, model_name, enabled, updated_at) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(provider) DO UPDATE SET api_key=excluded.api_key, model_name=excluded.model_name, enabled=excluded.enabled, updated_at=excluded.updated_at",
-            (provider_name, api_key, model_name, int(enabled), time.time()),
-        )
-
-    return {"provider": provider_name, "saved": True, "runtime": get_runtime_provider_config()}
+def save_provider_settings_route(payload: ProviderSettingsRequest, authorization: Optional[str] = Header(None)):
+    user_id = _current_user(authorization)
+    provider_name = payload.provider.strip().lower()
+    if provider_name not in SUPPORTED_PROVIDERS or provider_name not in {"google", "openrouter"}:
+        raise HTTPException(400, "Unsupported provider")
+    if not payload.model_name.strip():
+        raise HTTPException(400, "model_name is required")
+    save_provider_settings(user_id, provider_name, payload.api_key.strip(), payload.model_name.strip(), payload.enabled)
+    return {"provider": provider_name, "saved": True, "configured": get_provider_settings(user_id)[provider_name]["configured"]}
 
 
 @app.post("/auth/logout")
@@ -671,20 +817,12 @@ def logout(authorization: Optional[str] = Header(None), refresh_token: Optional[
 @app.get("/profile")
 def get_profile(authorization: Optional[str] = Header(None)):
     user_id = _current_user(authorization)
-    with sqlite3.connect(AUTH_DB_PATH) as connection:
-        user = connection.execute(
-            "SELECT username FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    if not user:
-        raise HTTPException(404, "User not found")
+    user = _require_user(user_id)
 
     return {
         "user_id": user_id,
-        "username": user[0],
-        "provider_settings": get_provider_settings(),
+        "username": user.username,
         "supported_providers": SUPPORTED_PROVIDERS,
-        "storage_dir": str(STORAGE_DIR / user_id),
     }
 
 
@@ -697,19 +835,60 @@ def chat_history(authorization: Optional[str] = Header(None)):
 @app.get("/chat/history/{conversation_id}")
 def chat_history_detail(conversation_id: str, authorization: Optional[str] = Header(None)):
     user_id = _current_user(authorization)
+    if not _conversation_exists(user_id, conversation_id):
+        raise HTTPException(404, "Conversation not found")
     return {"conversation_id": conversation_id, "messages": _get_conversation_messages(user_id, conversation_id)}
+
+
+@app.delete("/chat/history/{conversation_id}")
+def delete_conversation(conversation_id: str, authorization: Optional[str] = Header(None)):
+    """Delete a conversation and all its messages."""
+    user_id = _current_user(authorization)
+    _init_chat_history_storage()
+    
+    try:
+        with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
+            # Verify user owns this conversation
+            conv = connection.execute(
+                "SELECT user_id FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            
+            if not conv or conv[0] != user_id:
+                raise HTTPException(403, "Unauthorized to delete this conversation")
+            
+            # Delete messages
+            connection.execute(
+                "DELETE FROM messages WHERE conversation_id = ?",
+                (conversation_id,),
+            )
+            # Delete conversation
+            connection.execute(
+                "DELETE FROM conversations WHERE id = ?",
+                (conversation_id,),
+            )
+            connection.commit()
+        
+        return {"status": "deleted", "conversation_id": conversation_id}
+    except Exception as error:
+        raise HTTPException(500, "Failed to delete conversation") from error
 
 
 @app.post("/chat/save")
 def save_chat_message(data: dict[str, Any], authorization: Optional[str] = Header(None)):
     user_id = _current_user(authorization)
+    _enforce_rate_limit("chat_save", user_id, CHAT_RATE_LIMIT * 2)
     conversation_id = data.get("conversation_id")
     role = data.get("role", "user")
     content = str(data.get("content") or "")
     title = data.get("title")
     created_at = data.get("created_at")
-    if not content:
-        raise HTTPException(400, "content is required")
+    if role not in {"user", "assistant"}:
+        raise HTTPException(422, "role must be user or assistant")
+    if not content or len(content) > 12000:
+        raise HTTPException(400, "content must be between 1 and 12000 characters")
+    if conversation_id is not None and not _conversation_exists(user_id, str(conversation_id)):
+        raise HTTPException(404, "Conversation not found")
     return {"conversation_id": _save_chat_message(user_id, role, content, conversation_id, created_at, title)}
 
 
@@ -722,101 +901,206 @@ def root():
         "vector_db_enabled": USE_VECTOR_DB
     }
 
-@app.post("/upload_file")
-async def upload_file(file: UploadFile = File(...), authorization: Optional[str] = Header(None)):
+def _ingest_file(user_id: str, conversation_id: str, document_id: str, path: str) -> None:
+    agent = _get_agent(user_id, conversation_id)
+    job = agent.get_job(document_id)
+    agent.ingest_file(document_id, path, display_name=job.get("filename") if job else None)
+
+
+@app.get("/health")
+def health():
+    """Liveness probe: the process is able to serve HTTP requests."""
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def readiness():
+    """Readiness probe: required persistence services are reachable."""
+    checks = {"database": False, "redis": not bool(REDIS_URL)}
+    try:
+        if SessionLocal is not None:
+            with SessionLocal() as db:
+                db.execute(text("SELECT 1"))
+        else:
+            with sqlite3.connect(AUTH_DB_PATH) as connection:
+                connection.execute("SELECT 1")
+        checks["database"] = True
+    except Exception:
+        pass
+    try:
+        checks["redis"] = redis_client is not None and bool(redis_client.ping())
+    except Exception:
+        pass
+    if not all(checks.values()):
+        raise HTTPException(503, {"status": "not_ready", "checks": checks})
+    return {"status": "ready", "checks": checks}
+
+
+@app.get("/metrics")
+def metrics(authorization: Optional[str] = Header(None)):
+    """Authenticated operational summary; values intentionally exclude secrets."""
+    _current_user(authorization)
+    with _metrics_lock:
+        snapshot = dict(_metrics)
+    request_count = snapshot["requests"]
+    return {
+        "requests": request_count,
+        "errors": snapshot["errors"],
+        "average_response_ms": round(snapshot["response_ms_total"] / request_count, 1) if request_count else 0,
+        "llm_requests": snapshot["llm_requests"],
+        "llm_by_provider": dict(snapshot["llm_by_provider"]),
+        "active_cached_users": len(agents),
+        "uploaded_documents": sum(len(agent.list_jobs()) for agent in agents.values()),
+    }
+
+
+@app.get("/documents")
+def list_documents(conversation_id: str = Query(...), authorization: Optional[str] = Header(None)):
+    user_id = _current_user(authorization)
+    if not _conversation_exists(user_id, conversation_id):
+        raise HTTPException(404, "Conversation not found")
+    return {"documents": _get_agent(user_id, conversation_id).list_jobs()}
+
+
+@app.get("/documents/{document_id}")
+def get_document(document_id: str, conversation_id: str = Query(...), authorization: Optional[str] = Header(None)):
+    user_id = _current_user(authorization)
+    if not _conversation_exists(user_id, conversation_id):
+        raise HTTPException(404, "Conversation not found")
+    job = _get_agent(user_id, conversation_id).get_job(document_id)
+    if job is None:
+        raise HTTPException(404, "Document not found")
+    return job
+
+
+@app.get("/documents/{document_id}/pages/{page_number}")
+def get_document_page(document_id: str, page_number: int, conversation_id: str = Query(...), authorization: Optional[str] = Header(None)):
+    user_id = _current_user(authorization)
+    if not _conversation_exists(user_id, conversation_id):
+        raise HTTPException(404, "Conversation not found")
+    page = _get_agent(user_id, conversation_id).get_document_page(document_id, page_number)
+    if page is None:
+        raise HTTPException(404, "Document page not found")
+    return page
+
+
+@app.post("/upload_file", status_code=status.HTTP_202_ACCEPTED)
+async def upload_file(background_tasks: BackgroundTasks, conversation_id: str = Form(...), file: UploadFile = File(...), authorization: Optional[str] = Header(None)):
     """Accept PDF or image uploads. Extract text and add to agent's docs.
     Returns path and a short message. Multiple uploads can be sent in sequence.
     """
-    agent = _get_agent(_current_user(authorization))
+    user_id = _current_user(authorization)
+    if not _conversation_exists(user_id, conversation_id):
+        raise HTTPException(404, "Conversation not found")
+    _enforce_rate_limit("upload", user_id, UPLOAD_RATE_LIMIT)
+    agent = _get_agent(user_id, conversation_id)
 
     # save file
     filename = Path(file.filename or "upload").name
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(415, "Unsupported file type")
+    content_type = (file.content_type or "").lower()
+    expected_types = {
+        ".pdf": {"application/pdf"},
+        ".txt": {"text/plain"}, ".md": {"text/markdown", "text/plain"},
+        ".png": {"image/png"}, ".jpg": {"image/jpeg"}, ".jpeg": {"image/jpeg"},
+        ".gif": {"image/gif"}, ".bmp": {"image/bmp"}, ".tiff": {"image/tiff"},
+    }
+    if content_type and content_type != "application/octet-stream" and content_type not in expected_types[suffix]:
+        raise HTTPException(415, "File content type does not match its extension")
+    if len(agent.list_jobs()) >= MAX_FILES_PER_USER:
+        raise HTTPException(429, f"Maximum document limit reached ({MAX_FILES_PER_USER})")
 
-    user_dir = STORAGE_DIR / _current_user(authorization)
-    user_dir.mkdir(parents=True, exist_ok=True)
-    out_path = user_dir / f"{uuid4().hex}{suffix}"
+    out_path = agent.upload_dir / f"{uuid4().hex}{suffix}"
     try:
         content = await file.read()
         if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
             raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_MB} MB limit")
+        if not content:
+            raise HTTPException(400, "Uploaded file is empty")
+        if suffix == ".pdf" and not content.startswith(b"%PDF-"):
+            raise HTTPException(415, "Invalid PDF file")
+        if suffix in {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"}:
+            try:
+                probe = Image.open(BytesIO(content))
+                probe.verify()
+            except Exception as error:
+                raise HTTPException(415, "Invalid image file") from error
         out_path.write_bytes(content)
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(500, f"Failed to save file: {e}")
+    except Exception as error:
+        raise HTTPException(500, "Failed to save uploaded file") from error
 
-    # Detect file type from the validated extension.
-    suf = out_path.suffix.lower()
-    try:
-        if suf == ".pdf":
-            agent.add_pdf(str(out_path))
-        elif suf in (".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"):
-            agent.add_image(str(out_path))
-        else:
-            agent.add_text(str(out_path))
-    except Exception as e:
-        raise HTTPException(500, f"Failed to ingest file: {e}")
-
-    # optionally build vector DB
-    if USE_VECTOR_DB and LANGCHAIN_AVAILABLE:
-        try:
-            agent.build_vector_db()
-        except Exception as e:
-            # don't block on vector DB build failure
-            return {
-                "message": "File uploaded, but vector DB build failed.",
-                "detail": str(e),
-                "path": str(out_path)
-            }
-
-    return {"message": "File uploaded and ingested.", "path": str(out_path)}
+    document_id = agent.create_ingestion_job(filename)
+    background_tasks.add_task(_ingest_file, user_id, conversation_id, document_id, str(out_path))
+    return {"message": "File uploaded and processing will start shortly.", "document_id": document_id, "status": "uploaded"}
 
 @app.post("/chat")
 def chat(request: QueryRequest, authorization: Optional[str] = Header(None)):
-    agent = _get_agent(_current_user(authorization))
+    user_id = _current_user(authorization)
+    if not _conversation_exists(user_id, request.conversation_id):
+        raise HTTPException(404, "Conversation not found")
+    _enforce_rate_limit("chat", user_id, CHAT_RATE_LIMIT)
+    agent = _get_agent(user_id, request.conversation_id)
 
     try:
-        answer = agent.answer(request.question, k=request.k)
-        return {"answer": answer}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        with _metrics_lock:
+            _metrics["llm_requests"] += 1
+            _metrics["llm_by_provider"][LLM_PROVIDER] += 1
+        return agent.answer_with_sources(request.question, k=request.k)
+    except Exception as error:
+        logger.exception(json.dumps({"event": "chat_model_failed", "user_id": user_id, "error_type": type(error).__name__}))
+        raise HTTPException(502, "The model request failed") from error
 
 
 @app.post("/chat_with_image")
 async def chat_with_image(
     question: str = Form(...),
+    conversation_id: str = Form(...),
     image: Optional[UploadFile] = File(None), 
     k: Optional[int] = Form(5),
     authorization: Optional[str] = Header(None)
 ):
-    agent = _get_agent(_current_user(authorization))
+    user_id = _current_user(authorization)
+    if not _conversation_exists(user_id, conversation_id):
+        raise HTTPException(404, "Conversation not found")
+    _enforce_rate_limit("chat_image", user_id, CHAT_RATE_LIMIT)
+    if not question.strip() or len(question) > 4000:
+        raise HTTPException(422, "question must be between 1 and 4000 characters")
+    agent = _get_agent(user_id, conversation_id)
     
     img_data = None
     if image is not None:
         try:
             img_stream = BytesIO(await image.read())
             img_data = Image.open(img_stream)
-        except Exception as e:
-            raise HTTPException(500, f"Failed to process image: {e}")
+        except Exception as error:
+            raise HTTPException(415, "Failed to process image") from error
 
     try:
-        answer = agent.answer(question, image=img_data, k=k)
-        return {"answer": answer}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+        with _metrics_lock:
+            _metrics["llm_requests"] += 1
+            _metrics["llm_by_provider"][LLM_PROVIDER] += 1
+        return agent.answer_with_sources(question, image=img_data, k=k or 5)
+    except Exception as error:
+        logger.exception(json.dumps({"event": "image_chat_model_failed", "user_id": user_id, "error_type": type(error).__name__}))
+        raise HTTPException(502, "The model request failed") from error
 
 @app.post("/summarize")
-def summarize(authorization: Optional[str] = Header(None)):
-    agent = _get_agent(_current_user(authorization))
+def summarize(conversation_id: str = Query(...), authorization: Optional[str] = Header(None)):
+    user_id = _current_user(authorization)
+    if not _conversation_exists(user_id, conversation_id):
+        raise HTTPException(404, "Conversation not found")
+    _enforce_rate_limit("summarize", user_id, max(1, CHAT_RATE_LIMIT // 3))
+    agent = _get_agent(user_id, conversation_id)
 
     try:
         summaries = agent.summarize_all()
         return {"summaries": summaries}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    except Exception as error:
+        raise HTTPException(502, "The model request failed") from error
 
 
 if __name__ == "__main__":

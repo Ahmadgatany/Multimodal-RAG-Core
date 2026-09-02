@@ -1,440 +1,264 @@
-import os
+from __future__ import annotations
+
+import hashlib
+import re
 import sqlite3
-from typing import Optional, List, Dict
+import time
 from pathlib import Path
+from typing import Any, Optional
+from uuid import uuid4
+
 from PIL import Image
+import requests
 
 try:
-    import torch
-except ImportError:
-    torch = None
-
-try:
-    from .config import DB_PATH, EMBEDDING_MODEL, GOOGLE_API_KEY, GOOGLE_MODEL, LLM_PROVIDER, OPENROUTER_API_KEY, OPENROUTER_APP_NAME, OPENROUTER_MODEL, OPENROUTER_SITE_URL, UPLOAD_DIR, USE_VECTOR_DB
+    from .config import DB_PATH, EMBEDDING_MODEL, EMBEDDING_PROVIDER, UPLOAD_DIR, USE_VECTOR_DB, get_runtime_provider_config
     from .llm_provider import GeminiProvider, OpenRouterProvider
-except ImportError:
-    from config import DB_PATH, EMBEDDING_MODEL, GOOGLE_API_KEY, GOOGLE_MODEL, LLM_PROVIDER, OPENROUTER_API_KEY, OPENROUTER_APP_NAME, OPENROUTER_MODEL, OPENROUTER_SITE_URL, UPLOAD_DIR, USE_VECTOR_DB
+except ImportError:  # pragma: no cover
+    from config import DB_PATH, EMBEDDING_MODEL, EMBEDDING_PROVIDER, UPLOAD_DIR, USE_VECTOR_DB, get_runtime_provider_config
     from llm_provider import GeminiProvider, OpenRouterProvider
 
-# --- Transformers ---
-# -------------------
 try:
     from langchain_community.vectorstores import FAISS
-    from langchain_community.document_loaders import PyPDFLoader
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from langchain.schema import Document
-    from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+    from langchain_core.documents import Document
+    from langchain_core.embeddings import Embeddings
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
     LANGCHAIN_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover
     LANGCHAIN_AVAILABLE = False
-    print("Warning: LangChain not found. Vector DB features will be disabled.")
+    Embeddings = object
 
-# --- OCR ---
 try:
     import pytesseract
     OCR_AVAILABLE = True
-except ImportError:
+except ImportError:  # pragma: no cover
     OCR_AVAILABLE = False
 
-# --- PDF Fallback  ---
-try:
-    from PyPDF2 import PdfReader
-except ImportError:
-    pass
+
+class OpenRouterEmbeddings(Embeddings):
+    """LangChain-compatible embedding adapter that keeps vectors remote."""
+
+    endpoint = "https://openrouter.ai/api/v1/embeddings"
+
+    def __init__(self, api_key: str, model: str, site_url: str = "", app_name: str = ""):
+        self.api_key = api_key
+        self.model = model
+        self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        if site_url:
+            self.headers["HTTP-Referer"] = site_url
+        if app_name:
+            self.headers["X-Title"] = app_name
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        payload: dict[str, Any] = {"model": self.model, "input": texts, "encoding_format": "float"}
+        response = requests.post(self.endpoint, headers=self.headers, json=payload, timeout=90)
+        response.raise_for_status()
+        data = response.json().get("data", [])
+        if len(data) != len(texts):
+            raise RuntimeError("OpenRouter returned an incomplete embeddings response")
+        return [item["embedding"] for item in sorted(data, key=lambda item: item["index"])]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [vector for offset in range(0, len(texts), 64) for vector in self._embed(texts[offset:offset + 64])]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed([text])[0]
+
 
 class RAGCore:
- 
+    """Per-user persistent document store and retrieval pipeline."""
 
-    def __init__(
-        self,
-        model_id: Optional[str] = None,
-        embedding_model: Optional[str] = None,
-        device: Optional[str] = None,
-        upload_dir: Optional[str] = None,
-        db_path: Optional[str] = None,
-        use_vector_db: Optional[bool] = None,
-    ):
-        # Defaults (fall back to env or sane defaults)
-        self.model_id = model_id or os.getenv("HF_MODEL_ID", "Qwen/Qwen2.5-VL-7B-Instruct")
-        self.embedding_model = embedding_model or EMBEDDING_MODEL
-        self.device = device or ("cuda" if torch is not None and torch.cuda.is_available() else "cpu")
+    def __init__(self, upload_dir: Optional[str] = None, db_path: Optional[str] = None, embedding_model: Optional[str] = None, user_id: Optional[str] = None):
         self.upload_dir = Path(upload_dir or UPLOAD_DIR)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = Path(db_path or os.getenv("DB_PATH", str(DB_PATH)))
+        self.db_path = Path(db_path or DB_PATH)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.use_vector_db = use_vector_db if use_vector_db is not None else USE_VECTOR_DB
-
-        # Model placeholders
-        self.tokenizer = None
-        self.model = None
-        self.processor = None     # for VL models
-        self.text_gen = None      # pipeline for text-only models
-        self.model_is_vl = False
-        self.provider = None
-
-        # Document storage: list of dicts { "source": str, "text": str }
-        self.docs: List[Dict[str, str]] = []
-        self._init_storage()
-        self.docs = self._load_docs()
-
-        # Vector DB placeholder
+        self.index_path = self.db_path.parent / "faiss_index"
+        self.embedding_model = embedding_model or EMBEDDING_MODEL
+        self.user_id = user_id
+        self.use_vector_db = USE_VECTOR_DB and LANGCHAIN_AVAILABLE
         self.vector_db = None
+        self._embeddings = None
+        self._init_storage()
+        self._load_vector_db()
 
-        # detect if LangChain available
-        try:
-            import langchain   # just to test import
-            self._langchain_available = True
-        except Exception:
-            self._langchain_available = False
+    def _connection(self):
+        return sqlite3.connect(self.db_path, timeout=30)
 
-        # detect OCR availability
-        try:
-            import pytesseract  # noqa: F401
-            self._ocr_available = True
-        except Exception:
-            self._ocr_available = False
+    def _init_storage(self) -> None:
+        with self._connection() as connection:
+            connection.execute("CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY AUTOINCREMENT, document_id TEXT, source TEXT NOT NULL, page_number INTEGER, text TEXT NOT NULL, content_hash TEXT, created_at REAL NOT NULL DEFAULT 0)")
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
+            for name, definition in (("document_id", "TEXT"), ("page_number", "INTEGER"), ("content_hash", "TEXT"), ("created_at", "REAL NOT NULL DEFAULT 0")):
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
+            connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_document_id ON documents(document_id)")
+            connection.execute("CREATE TABLE IF NOT EXISTS ingestion_jobs (document_id TEXT PRIMARY KEY, filename TEXT NOT NULL, status TEXT NOT NULL, detail TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL)")
 
-        if LLM_PROVIDER == "google":
-            self.provider = GeminiProvider(GOOGLE_API_KEY, GOOGLE_MODEL)
-        elif LLM_PROVIDER == "openrouter":
-            self.provider = OpenRouterProvider(
-                OPENROUTER_API_KEY,
-                OPENROUTER_MODEL,
-                OPENROUTER_SITE_URL,
-                OPENROUTER_APP_NAME,
-            )
-        else:
-            self._load_model()
-
-    def _init_storage(self):
-        with sqlite3.connect(self.db_path) as connection:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS documents ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, "
-                "text TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
-            )
-
-    def _load_docs(self) -> List[Dict[str, str]]:
-        with sqlite3.connect(self.db_path) as connection:
-            rows = connection.execute("SELECT source, text FROM documents ORDER BY id").fetchall()
-        return [{"source": source, "text": text} for source, text in rows]
-
-    def _add_doc(self, source: str, text: str):
-        if not text.strip():
-            return
-        document = {"source": source, "text": text}
-        self.docs.append(document)
-        with sqlite3.connect(self.db_path) as connection:
-            connection.execute(
-                "INSERT INTO documents (source, text) VALUES (?, ?)",
-                (source, text),
-            )
-
-    def add_text(self, text_path: str):
-        text = Path(text_path).read_text(encoding="utf-8", errors="ignore")
-        self._add_doc(text_path, text)
-
-    def _get_model_device(self):
-        try:
-            first_param = next(self.model.parameters())
-            return first_param.device
-        except Exception:
-            return torch.device(self.device if self.device in ("cuda","cpu") else "cpu")
-
-    def _load_model(self):
-        """Load tokenizer + model; handle text-only and vision+language variants carefully."""
-        try:
-            print("[core] Loading model:", self.model_id, "on", self.device)
-            mid = (self.model_id or "").lower()
-            is_vl = "qwen" in mid and ("-vl" in mid or mid.endswith("vl") or "vl-" in mid)
-            if is_vl:
-                # Try to load VL-capable model. This requires a recent transformers & vendor code.
-                try:
-                    from transformers import AutoTokenizer, AutoProcessor
-                    # Some environments provide a generic Vision2Seq wrapper; try its import dynamically:
-                    try:
-                        from transformers import AutoModelForVision2Seq  # may not exist
-                        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True)
-                        self.processor = AutoProcessor.from_pretrained(self.model_id)
-                        self.model = AutoModelForVision2Seq.from_pretrained(
-                            self.model_id,
-                            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                            device_map="auto" if torch.cuda.is_available() else None,
-                            trust_remote_code=True,
-                        )
-                        self.model_is_vl = True
-                        self.text_gen = None
-                        print("[core] Loaded as vision+language (AutoModelForVision2Seq).")
-                        return
-                    except Exception:
-                        # fallback to vendor-specific Qwen class if available
-                        try:
-                            # Many vendor models expose QwenForConditionalGeneration-like class
-                            from transformers import AutoTokenizer, AutoProcessor
-                            from transformers import QwenForConditionalGeneration  # may not exist in env
-                            self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True)
-                            self.processor = AutoProcessor.from_pretrained(self.model_id)
-                            self.model = QwenForConditionalGeneration.from_pretrained(
-                                self.model_id,
-                                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                                device_map="auto" if torch.cuda.is_available() else None,
-                                trust_remote_code=True,
-                            )
-                            self.model_is_vl = True
-                            self.text_gen = None
-                            print("[core] Loaded as vision+language (QwenForConditionalGeneration).")
-                            return
-                        except Exception as e_qwen:
-                            raise RuntimeError(
-                                "Vision+Language model detected but required classes are missing. "
-                                "Install or upgrade 'transformers' (possibly from GitHub) and any model-specific packages. "
-                                f"Inner error: {e_qwen}"
-                            ) from e_qwen
-                except Exception as e_proc:
-                    raise RuntimeError(
-                        "Failed to import AutoTokenizer/AutoProcessor for VL model. "
-                        "Ensure 'transformers' is updated and 'trust_remote_code' may be required."
-                        f" Inner error: {e_proc}"
-                    ) from e_proc
-
-            # text-only model fallback
-            try:
-                from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-                self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True)
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_id,
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                    device_map="auto" if torch.cuda.is_available() else None,
-                    trust_remote_code=True,
+    def _embeddings_client(self):
+        if self._embeddings is None:
+            if EMBEDDING_PROVIDER == "openrouter":
+                config = get_runtime_provider_config(self.user_id)
+                if config["provider"] != "openrouter" or not config["api_key"]:
+                    raise RuntimeError("OpenRouter embeddings require an active OpenRouter API key")
+                self._embeddings = OpenRouterEmbeddings(
+                    api_key=config["api_key"], model=self.embedding_model,
+                    site_url=config.get("site_url", ""), app_name=config.get("app_name", ""),
                 )
-                # try to create a pipeline (if it fails, we'll still use model.generate)
-                try:
-                    self.text_gen = pipeline(
-                        "text-generation",
-                        model=self.model,
-                        tokenizer=self.tokenizer,
-                        device=0 if torch.cuda.is_available() else -1,
-                        max_new_tokens=512,
-                        do_sample=False,
-                    )
-                except Exception:
-                    self.text_gen = None
-                self.model_is_vl = False
-                print("[core] Loaded as text-only model.")
-                return
-            except Exception as e_text:
-                raise RuntimeError(
-                    "Failed to load text model. Ensure 'transformers' is installed and model_id is correct. "
-                    f"Inner error: {e_text}"
-                ) from e_text
+            elif EMBEDDING_PROVIDER == "local":
+                self._embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
+            else:
+                raise RuntimeError("EMBEDDING_PROVIDER must be 'local' or 'openrouter'")
+        return self._embeddings
 
-        except Exception as e:
-            print("[core] Model load failed:", e)
-            raise
-
-    # ---------------- File ingestion helpers ----------------
-    def add_pdf(self, pdf_path: str):
-        """Extract text from a PDF and append to docs. Uses langchain.PyPDFLoader if available, else PyPDF2."""
-        p = Path(pdf_path)
-        if not p.exists():
-            raise FileNotFoundError(pdf_path)
-
-        # try langchain loader first (if installed)
-        if self._langchain_available:
-            try:
-                from langchain_community.document_loaders import PyPDFLoader
-                loader = PyPDFLoader(str(pdf_path))
-                pages = loader.load()
-                for pg in pages:
-                    self._add_doc(str(pdf_path), pg.page_content)
-                return
-            except Exception:
-                # fallback to PyPDF2 below
-                pass
-
-        # fallback: PyPDF2
-        try:
-            from PyPDF2 import PdfReader
-            reader = PdfReader(str(pdf_path))
-            for page in reader.pages:
-                txt = page.extract_text() or ""
-                if txt.strip():
-                    self._add_doc(str(pdf_path), txt)
+    def _load_vector_db(self) -> None:
+        if not self.use_vector_db or not (self.index_path / "index.faiss").exists():
             return
-        except Exception as e:
-            raise RuntimeError(f"Failed to extract text from PDF: {e}") from e
-
-    def add_image(self, img_path: str):
-        """Extract text from image using OCR if available; otherwise store placeholder reference."""
-        p = Path(img_path)
-        if not p.exists():
-            raise FileNotFoundError(img_path)
-
-        extracted = ""
-        if self._ocr_available:
-            try:
-                import pytesseract
-                img = Image.open(str(img_path))
-                extracted = pytesseract.image_to_string(img)
-            except Exception:
-                extracted = ""
-        if not extracted:
-            # store a small placeholder hint so that user knows image exists
-            extracted = f"[no OCR text] Image saved at: {img_path}"
-        self._add_doc(str(img_path), extracted)
-
-    # ---------------- Vector DB ----------------
-    def build_vector_db(self, chunk_size: int = 1000, chunk_overlap: int = 100):
-        """Build FAISS vector DB from self.docs using HuggingFace embeddings via LangChain (if available)."""
-        if not self._langchain_available:
-            raise RuntimeError("LangChain components are not available in this environment. Install langchain_community and langchain.")
-
-        # import lazily
         try:
-            from langchain.text_splitter import RecursiveCharacterTextSplitter
-            from langchain.schema import Document
-            from langchain_huggingface.embeddings import HuggingFaceEmbeddings
-            from langchain_community.vectorstores import FAISS
-        except Exception as e:
-            raise RuntimeError(f"Missing LangChain components for vector DB build: {e}") from e
+            self.vector_db = FAISS.load_local(str(self.index_path), self._embeddings_client(), allow_dangerous_deserialization=True)
+        except Exception:
+            self.vector_db = None
 
-        # assemble docs into LangChain Document objects
-        lc_docs = []
-        for d in self.docs:
-            lc_docs.append(Document(page_content=d["text"], metadata={"source": d["source"]}))
+    def create_ingestion_job(self, filename: str) -> str:
+        document_id, now = uuid4().hex, time.time()
+        with self._connection() as connection:
+            connection.execute("INSERT INTO ingestion_jobs VALUES (?, ?, 'uploaded', 'Waiting to be processed', ?, ?)", (document_id, filename, now, now))
+        return document_id
 
+    def _set_job(self, document_id: str, status: str, detail: Optional[str] = None) -> None:
+        with self._connection() as connection:
+            connection.execute("UPDATE ingestion_jobs SET status=?, detail=?, updated_at=? WHERE document_id=?", (status, detail, time.time(), document_id))
+
+    def get_job(self, document_id: str) -> Optional[dict[str, Any]]:
+        with self._connection() as connection:
+            row = connection.execute("SELECT document_id, filename, status, detail, created_at, updated_at FROM ingestion_jobs WHERE document_id=?", (document_id,)).fetchone()
+        return dict(zip(("document_id", "filename", "status", "detail", "created_at", "updated_at"), row)) if row else None
+
+    def list_jobs(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT document_id, filename, status, detail, created_at, updated_at FROM ingestion_jobs ORDER BY created_at DESC").fetchall()
+        keys = ("document_id", "filename", "status", "detail", "created_at", "updated_at")
+        return [dict(zip(keys, row)) for row in rows]
+
+    def get_document_page(self, document_id: str, page_number: int) -> Optional[dict[str, Any]]:
+        """Return extracted text for a cited page, scoped to this user's store."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT source, page_number, text FROM documents WHERE document_id=? AND page_number=? LIMIT 1",
+                (document_id, page_number),
+            ).fetchone()
+        if not row:
+            return None
+        return {"filename": Path(row[0]).name, "page_number": row[1], "text": row[2]}
+
+    def _add_doc(self, document_id: str, source: str, text: str, page_number: Optional[int] = None) -> bool:
+        text = text.strip()
+        if not text:
+            return False
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        with self._connection() as connection:
+            if connection.execute("SELECT 1 FROM documents WHERE document_id=? AND content_hash=?", (document_id, content_hash)).fetchone():
+                return False
+            connection.execute("INSERT INTO documents (document_id, source, page_number, text, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)", (document_id, source, page_number, text, content_hash, time.time()))
+        return True
+
+    def _add_pdf(self, document_id: str, pdf_path: str) -> int:
+        from pypdf import PdfReader
+        reader = PdfReader(pdf_path)
+        return sum(self._add_doc(document_id, pdf_path, page.extract_text() or "", index) for index, page in enumerate(reader.pages, start=1))
+
+    def _add_image(self, document_id: str, image_path: str) -> int:
+        text = pytesseract.image_to_string(Image.open(image_path)) if OCR_AVAILABLE else ""
+        return int(self._add_doc(document_id, image_path, text or "[Image uploaded; no OCR text was detected.]", 1))
+
+    def _add_text(self, document_id: str, text_path: str) -> int:
+        return int(self._add_doc(document_id, text_path, Path(text_path).read_text(encoding="utf-8", errors="ignore"), 1))
+
+    def ingest_file(self, document_id: str, path: str, display_name: Optional[str] = None) -> None:
+        self._set_job(document_id, "processing")
+        try:
+            suffix = Path(path).suffix.lower()
+            count = self._add_pdf(document_id, path) if suffix == ".pdf" else self._add_image(document_id, path) if suffix in {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"} else self._add_text(document_id, path)
+            if not count:
+                raise ValueError("No extractable content was found in this file")
+            if display_name:
+                with self._connection() as connection:
+                    connection.execute("UPDATE documents SET source=? WHERE document_id=?", (Path(display_name).name, document_id))
+            self.build_vector_db()
+            self._set_job(document_id, "ready", f"Indexed {count} page(s)/section(s)")
+        except Exception as error:
+            self._set_job(document_id, "failed", str(error)[:500])
+
+    def _records(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute("SELECT document_id, source, page_number, text FROM documents ORDER BY id").fetchall()
+        return [dict(zip(("document_id", "source", "page_number", "text"), row)) for row in rows]
+
+    def build_vector_db(self, chunk_size: int = 900, chunk_overlap: int = 120) -> None:
+        if not self.use_vector_db:
+            return
+        records = self._records()
+        if not records:
+            return
         splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        chunks = splitter.split_documents(lc_docs)
-        embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
-        self.vector_db = FAISS.from_documents(chunks, embeddings)
-        print("[core] Vector DB built with", len(chunks), "chunks.")
+        docs = [Document(page_content=row["text"], metadata={key: row[key] for key in ("document_id", "source", "page_number")}) for row in records]
+        self.vector_db = FAISS.from_documents(splitter.split_documents(docs), self._embeddings_client())
+        self.index_path.mkdir(parents=True, exist_ok=True)
+        self.vector_db.save_local(str(self.index_path))
 
-    def get_local_content(self, query: str, k: int = 5) -> str:
-        """Return concatenated top-k chunk texts from vector DB if available, otherwise naive substring search across docs."""
+    @staticmethod
+    def _tokens(text: str) -> set[str]:
+        return {token for token in re.findall(r"\w+", text.lower()) if len(token) > 2}
+
+    def retrieve(self, query: str, k: int = 5) -> list[dict[str, Any]]:
+        candidates = []
         if self.vector_db is not None:
-            try:
-                docs = self.vector_db.similarity_search(query, k=k)
-                return "\n\n".join(d.page_content for d in docs)
-            except Exception:
-                # fallback to naive
-                pass
+            for document, distance in self.vector_db.similarity_search_with_score(query, k=max(k * 3, 10)):
+                candidates.append({"text": document.page_content, **document.metadata, "semantic_score": float(distance)})
+        if not candidates:
+            candidates = self._records()
+        terms = self._tokens(query)
+        for item in candidates:
+            item["lexical_score"] = len(terms & self._tokens(item["text"])) / max(len(terms), 1)
+        candidates.sort(key=lambda row: (-row["lexical_score"], row.get("semantic_score", 0)))
+        return candidates[:max(1, min(k, 10))]
 
-        # naive substring search
-        matches = []
-        for d in self.docs:
-            if query.lower() in d["text"].lower():
-                matches.append(d["text"])
-                if len(matches) >= k:
-                    break
-        return "\n\n".join(matches)
+    def _provider(self):
+        config = get_runtime_provider_config(self.user_id)
+        if config["provider"] == "google":
+            return GeminiProvider(config["api_key"], config["model"])
+        if config["provider"] == "openrouter":
+            return OpenRouterProvider(config["api_key"], config["model"], config["site_url"], config["app_name"])
+        raise RuntimeError(f"Unsupported LLM provider: {config['provider']}")
 
-    # ---------------- Summarization helper ----------------
-    def summarize_all(self, max_new_tokens: int = 192) -> List[Dict[str, str]]:
-        """Summarize each uploaded doc using the loaded model."""
-        summaries = []
-        for d in self.docs:
-            text = d.get("text", "")
-            prompt = (
-                "Summarize the following text in 2-4 concise sentences, highlighting key points.\n\n"
-                f"TEXT:\n{text}\n\nSummary:"
-            )
-            try:
-                s = self.generate_text(prompt, max_new_tokens=max_new_tokens)
-            except Exception as e:
-                s = f"[summary failed: {e}]"
-            summaries.append({"source": d.get("source"), "summary": s})
-        return summaries
+    def generate_text(self, messages: list[dict[str, str]] | str, image: Optional[Image.Image] = None, max_new_tokens: int = 512) -> str:
+        prompt = messages if isinstance(messages, str) else "\n\n".join(f"{item['role'].upper()}: {item['content']}" for item in messages)
+        return self._provider().generate(prompt, image=image, max_output_tokens=max_new_tokens)
 
-    # ---------------- Generation & Answering ----------------
-    def generate_text(self, messages: List[Dict[str, str]], image: Optional[Image.Image] = None, max_new_tokens: int = 512) -> str:
-        """
-        Generate text handling Chat Templates correctly to avoid repetition.
-        messages example: [{"role": "user", "content": "Hello..."}]
-        """
-        if self.provider is not None:
-            if isinstance(messages, str):
-                prompt = messages
-            else:
-                prompt = "\n\n".join(
-                    f"{message['role'].upper()}: {message['content']}" for message in messages
-                )
-            return self.provider.generate(prompt, image=image, max_output_tokens=max_new_tokens)
-
-        # 1. Prepare inputs using Chat Template
-        text_prompt = self.processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        
-        inputs = None
-        if self.model_is_vl and image is not None:
-            inputs = self.processor(text=[text_prompt], images=image, return_tensors="pt", padding=True)
+    def answer_with_sources(self, question: str, image: Optional[Image.Image] = None, k: int = 5) -> dict[str, Any]:
+        if image is not None:
+            return {"answer": self.generate_text([{"role": "user", "content": f"Answer the question from this image: {question}"}], image=image), "sources": []}
+        records = self._records()
+        matches = self.retrieve(question, k) if records else []
+        if records and not matches:
+            return {"answer": "I could not find enough information in your uploaded documents to answer that question.", "sources": []}
+        if matches:
+            context = "\n\n".join(f"[Source: {Path(item['source']).name}, page {item.get('page_number') or 'N/A'}]\n{item['text']}" for item in matches)
+            messages = [{"role": "system", "content": "Answer only from the supplied context. If it is insufficient, say so clearly. Do not invent facts."}, {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}]
         else:
-          
-            if self.model_is_vl:
-                inputs = self.processor(text=[text_prompt], images=None, return_tensors="pt")
-            else:
-                inputs = self.tokenizer(text_prompt, return_tensors="pt")
-
-        # Move to device
-        model_device = self._get_model_device()
-        for k, v in inputs.items():
-            if isinstance(v, torch.Tensor):
-                inputs[k] = v.to(model_device)
-
-        # 2. Generate with Stop Configs (To fix repetition)
-        try:
-            gen_output = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=True,         
-                temperature=0.7,        
-                top_p=0.9,
-                repetition_penalty=1.1,  
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id  
-            )
-            
-            # Decode output
-            input_len = inputs.input_ids.shape[1]
-            generated_ids = gen_output[0][input_len:]
-            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-            return text.strip()
-            
-        except Exception as e:
-            raise RuntimeError(f"Generation failed: {e}") from e
+            messages = [{"role": "user", "content": question}]
+        answer = self.generate_text(messages)
+        seen, sources = set(), []
+        for item in matches:
+            key = (item["source"], item.get("page_number"))
+            if key not in seen:
+                seen.add(key)
+                sources.append({"document_id": item.get("document_id"), "filename": Path(item["source"]).name, "page_number": item.get("page_number")})
+        return {"answer": answer, "sources": sources}
 
     def answer(self, question: str, image: Optional[Image.Image] = None, k: int = 5) -> str:
-        messages = []
-        
-        # --- Case 1: Image ---
-        if image is not None:
-            content = f"Answer this question based on the image: {question}"
-            messages = [{"role": "user", "content": content}]
-            return self.generate_text(messages, image=image)
+        return self.answer_with_sources(question, image=image, k=k)["answer"]
 
-        # --- Case 2: RAG Context ---
-        context = ""
-        if self.docs:
-            if self.vector_db:
-                try:
-                    docs = self.vector_db.similarity_search(question, k=k)
-                    context = "\n\n".join(d.page_content for d in docs)
-                except:
-                    context = "\n\n".join(d["text"] for d in self.docs)
-            else:
-                context = self.get_local_content(question, k=k)
-        
-        if context:
-            system_msg = "You are a helpful assistant. Answer based strictly on the provided context."
-            user_msg = f"Context:\n{context}\n\nQuestion: {question}"
-            messages = [
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg}
-            ]
-        else:
-        # --- Case 3: General Knowledge ---
-            messages = [{"role": "user", "content": question}]
-
-        return self.generate_text(messages)
-
-    
+    def summarize_all(self, max_new_tokens: int = 192) -> list[dict[str, str]]:
+        return [{"source": row["source"], "summary": self.generate_text(f"Summarize this text in 2-4 concise sentences:\n\n{row['text']}", max_new_tokens=max_new_tokens)} for row in self._records()]

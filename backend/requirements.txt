@@ -1,30 +1,34 @@
 # Web Framework & Server
-fastapi
-uvicorn
-python-multipart
-pydantic
-python-dotenv
-requests
-PyJWT
-redis
-psycopg[binary]
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+gunicorn==23.0.0
+python-multipart==0.0.20
+pydantic==2.10.4
+python-dotenv==1.0.1
+requests==2.32.3
+PyJWT==2.10.1
+cryptography==44.0.0
+redis==5.2.1
+psycopg[binary]==3.2.3
+SQLAlchemy==2.0.36
+alembic==1.14.0
 
 # AI Models & Processing
 torch
-transformers
-accelerate
-sentence-transformers
-Pillow
-google-genai
+transformers==4.47.1
+accelerate==1.2.1
+sentence-transformers==3.3.1
+Pillow==11.0.0
+google-genai==1.0.0
 
 # RAG & Vector Database
-langchain
-langchain-community
-langchain-huggingface
-faiss-cpu
-beautifulsoup4
+langchain==0.3.13
+langchain-community==0.3.13
+langchain-huggingface==0.1.2
+faiss-cpu==1.9.0.post1
+beautifulsoup4==4.12.3
 
 # Document Loaders & OCR
-pypdf
-PyPDF2
-pytesseract
+pypdf==5.1.0
+PyPDF2==3.0.1
+pytesseract==0.3.13

@@ -11,6 +11,13 @@ RUN python -m pip install --upgrade pip && \
 
 COPY . .
 
+RUN useradd --create-home --uid 10001 appuser && \
+    mkdir -p /app/data && \
+    chmod +x /app/docker/entrypoint.sh && \
+    chown -R appuser:appuser /app
+
+USER appuser
+
 EXPOSE 8000
 
-CMD ["python", "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["/app/docker/entrypoint.sh"]

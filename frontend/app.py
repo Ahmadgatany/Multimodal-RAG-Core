@@ -1,20 +1,56 @@
 import os
 import time
-
 import requests
 import streamlit as st
 
 API_BASE_URL = os.getenv("RAG_API_URL", "http://localhost:8000").strip().rstrip("/")
 
 
+# ==========================================
+# BACKEND API HELPERS (Unchanged Logic)
+# ==========================================
+
 def api_headers():
     token = st.session_state.get("auth_token")
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+def api_request(method, path, *, retry_on_refresh=True, **kwargs):
+    """Send an authenticated request and rotate the access token once when needed."""
+    try:
+        response = requests.request(method, f"{API_BASE_URL}{path}", headers=api_headers(), **kwargs)
+    except requests.RequestException:
+        raise
+    if response.status_code != 401 or not retry_on_refresh or not st.session_state.get("refresh_token"):
+        return response
+    try:
+        refresh = requests.post(f"{API_BASE_URL}/auth/refresh", json={"refresh_token": st.session_state.refresh_token}, timeout=15)
+        if refresh.status_code != 200:
+            return response
+        tokens = refresh.json()
+        st.session_state.auth_token = tokens["token"]
+        st.session_state.refresh_token = tokens["refresh_token"]
+        return requests.request(method, f"{API_BASE_URL}{path}", headers=api_headers(), **kwargs)
+    except requests.RequestException:
+        return response
+
+
+def logout_from_backend():
+    if not st.session_state.get("auth_token"):
+        return
+    try:
+        api_request(
+            "POST", "/auth/logout",
+            params={"refresh_token": st.session_state.get("refresh_token", "")},
+            timeout=10,
+        )
+    except requests.RequestException:
+        pass
+
+
 def fetch_profile():
     try:
-        response = requests.get(f"{API_BASE_URL}/profile", headers=api_headers(), timeout=15)
+        response = api_request("GET", "/profile", timeout=15)
         if response.status_code == 200:
             return response.json()
     except requests.RequestException:
@@ -24,7 +60,7 @@ def fetch_profile():
 
 def fetch_conversations():
     try:
-        response = requests.get(f"{API_BASE_URL}/chat/history", headers=api_headers(), timeout=15)
+        response = api_request("GET", "/chat/history", timeout=15)
         if response.status_code == 200:
             st.session_state.conversations = response.json().get("conversations", [])
         else:
@@ -35,7 +71,7 @@ def fetch_conversations():
 
 def fetch_conversation_messages(conversation_id):
     try:
-        response = requests.get(f"{API_BASE_URL}/chat/history/{conversation_id}", headers=api_headers(), timeout=15)
+        response = api_request("GET", f"/chat/history/{conversation_id}", timeout=15)
         if response.status_code == 200:
             st.session_state.chat_messages = response.json().get("messages", [])
             st.session_state.conversation_id = conversation_id
@@ -56,7 +92,7 @@ def save_chat_message(role, content, conversation_id=None, title=None):
         "created_at": time.time(),
     }
     try:
-        response = requests.post(f"{API_BASE_URL}/chat/save", json=payload, headers=api_headers(), timeout=20)
+        response = api_request("POST", "/chat/save", json=payload, timeout=20)
         if response.status_code == 200:
             data = response.json()
             st.session_state.conversation_id = data.get("conversation_id")
@@ -66,10 +102,46 @@ def save_chat_message(role, content, conversation_id=None, title=None):
     return conversation_id
 
 
+def upload_file_to_backend(file_obj, conversation_id):
+    if file_obj is None:
+        return
+    files = {"file": (file_obj.name, file_obj.getvalue(), file_obj.type or "application/octet-stream")}
+    try:
+        response = api_request("POST", "/upload_file", data={"conversation_id": conversation_id}, files=files, timeout=120)
+        if response.status_code in (200, 202):
+            payload = response.json()
+            st.session_state.last_uploaded = file_obj.name
+            st.session_state.upload_jobs[payload.get("document_id")] = {"filename": file_obj.name, "status": payload.get("status", "uploaded")}
+            st.toast(f"Uploaded: {file_obj.name}", icon="✅")
+        else:
+            st.warning(f"{file_obj.name}: {response.text}")
+    except requests.RequestException:
+        st.error("Upload failed: backend unavailable")
+
+
+def refresh_upload_jobs():
+    conversation_id = st.session_state.get("conversation_id")
+    if not conversation_id:
+        return
+    for document_id in list(st.session_state.upload_jobs):
+        try:
+            response = api_request("GET", f"/documents/{document_id}", params={"conversation_id": conversation_id}, timeout=10)
+            if response.status_code == 200:
+                st.session_state.upload_jobs[document_id] = response.json()
+        except requests.RequestException:
+            continue
+
+
+# ==========================================
+# SESSION STATE INITIALIZATION
+# ==========================================
+
 if "auth_token" not in st.session_state:
     st.session_state.auth_token = None
+if "refresh_token" not in st.session_state:
+    st.session_state.refresh_token = None
 if "page" not in st.session_state:
-    st.session_state.page = "new_chat"
+    st.session_state.page = "chat"
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
 if "conversations" not in st.session_state:
@@ -80,16 +152,54 @@ if "selected_conversation" not in st.session_state:
     st.session_state.selected_conversation = None
 if "conversation_id" not in st.session_state:
     st.session_state.conversation_id = None
+if "output_text" not in st.session_state:
+    st.session_state.output_text = ""
+if "last_uploaded" not in st.session_state:
+    st.session_state.last_uploaded = ""
+if "upload_jobs" not in st.session_state:
+    st.session_state.upload_jobs = {}
+if "last_sources" not in st.session_state:
+    st.session_state.last_sources = []
+if "last_context_mode" not in st.session_state:
+    st.session_state.last_context_mode = "none"
+if "uploaded_file_ids" not in st.session_state:
+    st.session_state.uploaded_file_ids = set()
+if "upload_widget_version" not in st.session_state:
+    st.session_state.upload_widget_version = 0
+
+# ==========================================
+# AUTHENTICATION PAGE (Light Mode)
+# ==========================================
 
 if not st.session_state.auth_token:
-    st.set_page_config(page_title="MultiRAG", page_icon="✨", layout="centered")
-    st.title("Multi-Modal RAG Platform")
-    st.subheader("تسجيل الدخول")
-    auth_mode = st.radio("الإجراء", ["دخول", "إنشاء حساب"], horizontal=True, label_visibility="collapsed")
-    username = st.text_input("اسم المستخدم")
-    password = st.text_input("كلمة المرور", type="password")
+    st.set_page_config(page_title="MultiRAG - Login", page_icon="✨", layout="centered")
+    
+    st.markdown("""
+        <style>
+            html, body, [data-testid="stAppViewContainer"] {
+                background-color: #f8fafc;
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            }
+            .auth-card {
+                background: white;
+                padding: 40px;
+                border-radius: 16px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.05);
+                border: 1px solid #e2e8f0;
+                margin-top: 50px;
+            }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    st.markdown('<h1 style="text-align: center; color: #0f172a;">MultiRAG</h1>', unsafe_allow_html=True)
+    st.markdown('<p style="text-align: center; color: #64748b; margin-bottom: 20px;">Multimodal RAG Assistant</p>', unsafe_allow_html=True)
+    
+    auth_mode = st.radio("Action", ["Login", "Create account"], horizontal=True, label_visibility="collapsed")
+    username = st.text_input("Username", placeholder="Enter your username")
+    password = st.text_input("Password", type="password", placeholder="Enter your password")
+
     if st.button(auth_mode, type="primary", use_container_width=True):
-        endpoint = "/auth/login" if auth_mode == "دخول" else "/auth/register"
+        endpoint = "/auth/login" if auth_mode == "Login" else "/auth/register"
         try:
             response = requests.post(
                 f"{API_BASE_URL}{endpoint}",
@@ -97,318 +207,501 @@ if not st.session_state.auth_token:
                 timeout=10,
             )
             if response.status_code == 200:
-                if auth_mode == "إنشاء حساب":
-                    st.success("تم إنشاء الحساب. سجّل الدخول الآن.")
+                if auth_mode == "Create account":
+                    st.success("Account created. Please sign in.")
                 else:
                     payload = response.json()
                     st.session_state.auth_token = payload["token"]
+                    st.session_state.refresh_token = payload.get("refresh_token")
                     st.session_state.username = payload["username"]
+                    st.session_state.page = "chat"
                     st.session_state.chat_messages = []
                     st.session_state.conversation_id = None
                     st.session_state.selected_conversation = None
-                    st.session_state.page = "new_chat"
                     st.rerun()
             else:
-                st.error(response.json().get("detail", "تعذر تنفيذ العملية"))
+                st.error(response.json().get("detail", "Operation failed"))
         except requests.RequestException:
-            st.error("الـ backend غير متاح")
+            st.error("Backend is unavailable")
     st.stop()
+
+# ==========================================
+# MAIN APPLICATION LAYOUT (Light Mode UI)
+# ==========================================
 
 st.set_page_config(page_title="MultiRAG", page_icon="✨", layout="wide")
 
+# Custom Light Theme & Layout Fixes CSS
 st.markdown(
     """
     <style>
-    html, body, [data-testid="stAppViewContainer"] { background: #f5f7fb; }
-    [data-testid="stSidebar"] { background: linear-gradient(180deg, #0f172a, #1f2638); }
-    [data-testid="stSidebar"] * { color: #edf2ff; }
-    .brand-box { display: flex; align-items: center; gap: 10px; margin: 12px 0 18px; }
-    .brand-mark {
-        width: 28px; height: 28px; border-radius: 9px;
-        background: linear-gradient(135deg, #8c7ef6, #6c5ce7);
-        display: inline-flex; align-items: center; justify-content: center;
-        font-size: 12px; font-weight: 800; color: white;
+    :root {
+        --bg-main: #f8fafc;
+        --sidebar-bg: #ffffff;
+        --card-bg: #ffffff;
+        --text-dark: #0f172a;
+        --text-muted: #64748b;
+        --primary: #2563eb;
+        --primary-light: #dbeafe;
+        --border-color: #e2e8f0;
     }
-    .brand-label { font-size: 22px; font-weight: 800; }
-    .brand-sub { color: #bfc9db; font-size: 12px; margin-top: 2px; }
-    .primary-button > button {
-        background: linear-gradient(135deg, #745ef5, #8d66f5);
-        border: none; border-radius: 12px; color: white; font-weight: 800; height: 48px;
+
+    html, body, [data-testid="stAppViewContainer"] {
+        background-color: var(--bg-main);
+        color: var(--text-dark);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
-    .sidebar-list .stButton > button {
-        width: 100%; text-align: left; border-radius: 12px; border: 1px solid rgba(255,255,255,0.06);
-        background: rgba(255,255,255,0.02); color: #e8ecff; padding: 10px 12px;
+
+    /* Left Sidebar Styling */
+    [data-testid="stSidebar"] {
+        background-color: var(--sidebar-bg) !important;
+        border-right: 1px solid var(--border-color);
+        padding-top: 1rem;
     }
-    .sidebar-list .stButton > button:hover { background: rgba(125, 112, 255, 0.14); }
-    .sidebar-plan {
-        background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 14px 12px; margin-top: 18px;
+
+    /* Profile Badge at Top of Sidebar */
+    .user-profile-badge {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 14px;
+        background: #f1f5f9;
+        border-radius: 12px;
+        margin-bottom: 20px;
+        border: 1px solid #e2e8f0;
     }
-    .sidebar-plan .plan-title { color: #f1f5ff; font-weight: 700; }
-    .workspace-label { color: #bfc9db; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; margin: 20px 0 10px; }
-    .main-shell { background: #f6f7fb; border-radius: 20px; }
-    .main-title { font-size: 30px; font-weight: 800; margin: 0 0 4px; color: #1f2430; }
-    .subtitle { color: #64748b; font-size: 14px; margin: 0 0 18px; }
-    .chat-header {
-        display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.72);
-        border: 1px solid #edf0f4; border-radius: 14px; padding: 12px 16px; margin-bottom: 10px;
+    .user-avatar {
+        width: 38px;
+        height: 38px;
+        border-radius: 50%;
+        background: var(--primary);
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        font-size: 1rem;
     }
-    .chat-header .title { font-size: 14px; color: #1f2430; font-weight: 700; }
-    .header-actions { display: flex; gap: 8px; }
-    .small-pill {
-        background: white; border: 1px solid #e8edf4; border-radius: 10px; padding: 7px 12px; color: #374151; font-weight: 600; font-size: 12px;
+    .user-name {
+        font-weight: 600;
+        color: var(--text-dark);
+        font-size: 0.95rem;
     }
-    .content-card {
-        background: rgba(255,255,255,0.86); border: 1px solid #edf0f4; border-radius: 18px; padding: 18px 18px 8px; box-shadow: 0 2px 8px rgba(15,23,42,0.02);
+
+    .brand-title {
+        font-size: 2rem;
+        font-weight: 800;
+        color: var(--text-dark);
+        margin-bottom: 0px;
+        line-height: 1.1;
     }
-    .assistant-bubble {
-        max-width: 100%;
-        background: #ffffff; border: 1px solid #edf0f4; color: #2a3040; border-radius: 18px; padding: 16px 18px; margin: 14px 0; line-height: 1.65; font-size: 15px;
+    .brand-sub {
+        font-size: 0.88rem;
+        color: var(--text-muted);
+        margin-bottom: 20px;
     }
-    .user-bubble {
-        max-width: 100%;
-        background: #efeaff; border: 1px solid #e5dcff; color: #2a3040; border-radius: 18px; padding: 16px 18px; margin: 14px 0; line-height: 1.65; font-size: 15px;
+
+    /* Sidebar Buttons */
+    .stButton > button {
+        border-radius: 10px !important;
+        border: 1px solid var(--border-color) !important;
+        background-color: #ffffff !important;
+        color: var(--text-dark) !important;
+        font-weight: 600 !important;
+        transition: all 0.2s ease;
     }
-    .source-box {
-        background: #f5f7fb; border: 1px solid #eaedf3; border-radius: 12px; padding: 12px 14px; color: #607089; font-size: 13px;
+    
+    .stButton > button:hover {
+        background-color: #f1f5f9 !important;
+        border-color: #cbd5e1 !important;
     }
-    .bottom-input {
-        background: white; border: 1px solid #ecedf2; border-radius: 18px; padding: 10px 12px 12px; box-shadow: 0 2px 10px rgba(15,23,42,0.02);
+
+    /* Fix Sidebar Chat Item Alignment (Issue 3) */
+    [data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+        align-items: center !important;
+        gap: 6px !important;
+        margin-bottom: 4px;
     }
-    .bottom-input .stButton > button {
-        background: transparent; border: 1px solid #e7ebf0; border-radius: 12px; color: #3d4c64; font-weight: 600;
+
+    .sidebar-section-title {
+        color: var(--text-muted);
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        margin-top: 20px;
+        margin-bottom: 10px;
     }
-    .send-btn > button {
-        background: linear-gradient(135deg, #7b67f5, #6d5ef3); border: none; border-radius: 12px; color: white; font-weight: 700;
+
+    /* Chat Messages & Cards */
+    .chat-bubble-user {
+        background-color: var(--primary-light);
+        color: #1e3a8a;
+        padding: 14px 18px;
+        border-radius: 16px 16px 2px 16px;
+        margin-bottom: 12px;
+        max-width: 80%;
+        margin-left: auto;
+        font-size: 0.95rem;
     }
-    .right-card {
-        background: rgba(255,255,255,0.9); border: 1px solid #edf0f4; border-radius: 18px; padding: 18px 16px; box-shadow: 0 2px 10px rgba(15,23,42,0.02);
+
+    .chat-bubble-assistant {
+        background-color: #ffffff;
+        color: var(--text-dark);
+        border: 1px solid var(--border-color);
+        padding: 14px 18px;
+        border-radius: 16px 16px 16px 2px;
+        margin-bottom: 12px;
+        max-width: 85%;
+        font-size: 0.95rem;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.02);
     }
-    .avatar { width: 72px; height: 72px; border-radius: 50%; margin: 0 auto 12px; display:flex; align-items:center; justify-content:center; font-weight:800; font-size: 28px; color:white; background: linear-gradient(135deg, #d6c4ff, #7561f8); }
-    .info-pill {
-        display: inline-block; padding: 6px 12px; border-radius: 999px; background: #f0e9ff; color: #6b50ef; font-size: 12px; font-weight: 700;
+
+    /* File Attachment Badge */
+    .file-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        background: #ffffff;
+        border: 1px solid #cbd5e1;
+        padding: 6px 12px;
+        border-radius: 20px;
+        font-size: 0.82rem;
+        color: #475569;
+        margin-bottom: 10px;
     }
-    .stat-box {
-        background: #f7f9fd; border: 1px solid #eceff5; border-radius: 10px; padding: 10px 12px; text-align: center;
+
+    /* Modern Unified Input Card Styling (Issue 2) */
+    [data-testid="stForm"] {
+        border: 1px solid #cbd5e1 !important;
+        border-radius: 16px !important;
+        padding: 16px !important;
+        background-color: #ffffff !important;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.03) !important;
     }
-    .stat-box .label { color: #6b7280; font-size: 12px; }
-    .stat-box .value { color:#1f2937; font-size: 18px; font-weight: 800; }
-    .right-menu .stButton > button {
-        width: 100%; border: none; background: transparent; color: #2a3445; text-align: left; border-radius: 10px; padding: 10px 12px;
+
+    [data-testid="stForm"] textarea {
+        border: none !important;
+        box-shadow: none !important;
+        background-color: transparent !important;
+        padding: 0 !important;
     }
-    .theme-row .stButton > button { background: #f1f4fa; border: none; color: #273141; border-radius: 12px; }
+
+    [data-testid="stForm"] textarea:focus {
+        outline: none !important;
+        box-shadow: none !important;
+    }
+
+    /* Hide Streamlit Header Padding */
+    .block-container {
+        padding-top: 2rem !important;
+        padding-bottom: 2rem !important;
+        max-width: 900px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+# Fetch user profile & status
 profile = fetch_profile() if st.session_state.auth_token else {}
 if profile:
     st.session_state.profile = profile
+user_name = st.session_state.profile.get("username", st.session_state.get("username", "Ahmed1"))
+first_letter = (user_name or "A")[0].upper()
 
-st.session_state.profile.setdefault("username", st.session_state.get("username", "Ahmed Mohamed"))
+refresh_upload_jobs()
+
+# ==========================================
+# LEFT SIDEBAR
+# ==========================================
 
 with st.sidebar:
+    # 1. User Profile at the Top
     st.markdown(
-        '<div class="brand-box"><div class="brand-mark">◈</div><div><div class="brand-label">MultiRAG</div><div class="brand-sub">Multimodal RAG Assistant</div></div></div>',
+        f"""
+        <div class="user-profile-badge">
+            <div class="user-avatar">{first_letter}</div>
+            <div class="user-name">{user_name}</div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
 
-    st.markdown('<div class="primary-button">', unsafe_allow_html=True)
-    if st.button("+ New Chat", key="sidebar_new_chat", use_container_width=True):
-        st.session_state.page = "new_chat"
-        st.session_state.chat_messages = []
+    # 2. MultiRAG Title
+    st.markdown('<div class="brand-title">MultiRAG</div>', unsafe_allow_html=True)
+    st.markdown('<div class="brand-sub">Multimodal RAG Assistant</div>', unsafe_allow_html=True)
+
+    # 3. New Chat Button
+    if st.button("+ New Chat", use_container_width=True, type="primary"):
+        st.session_state.page = "chat"
         st.session_state.selected_conversation = None
         st.session_state.conversation_id = None
+        st.session_state.chat_messages = []
+        st.session_state.output_text = ""
+        st.session_state.last_uploaded = ""
+        st.session_state.upload_jobs = {}
+        st.session_state.last_sources = []
+        st.session_state.last_context_mode = "none"
+        st.session_state.uploaded_file_ids = set()
+        st.session_state.upload_widget_version += 1
         st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown("<div class='workspace-label'>Chats</div>", unsafe_allow_html=True)
+    # 4. CHATS History List (Issue 3 Fixed Layout)
+    st.markdown("<div class='sidebar-section-title'>CHATS</div>", unsafe_allow_html=True)
     if not st.session_state.conversations:
         fetch_conversations()
-
-    st.markdown('<div class="sidebar-list">', unsafe_allow_html=True)
+        
     for item in st.session_state.conversations:
         label = item.get("title") or "New chat"
-        if st.button(label, key=f"conv_{item.get('id')}", use_container_width=True):
-            st.session_state.page = "chat"
-            st.session_state.selected_conversation = item.get("id")
-            fetch_conversation_messages(item.get("id"))
-            st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
+        conv_id = item.get("id")
+        
+        # Proper ratio [8, 2] keeps the delete button inside the chat item bounds
+        col1, col2 = st.columns([8, 2])
+        
+        with col1:
+            if st.button(f"💬 {label}", key=f"conv_{conv_id}", use_container_width=True):
+                st.session_state.page = "chat"
+                st.session_state.selected_conversation = conv_id
+                st.session_state.output_text = ""
+                st.session_state.last_uploaded = ""
+                st.session_state.upload_jobs = {}
+                st.session_state.last_sources = []
+                st.session_state.last_context_mode = "none"
+                st.session_state.uploaded_file_ids = set()
+                st.session_state.upload_widget_version += 1
+                fetch_conversation_messages(conv_id)
+                st.rerun()
+        
+        with col2:
+            if st.button("🗑️", key=f"delete_{conv_id}", help="Delete this chat", use_container_width=True):
+                try:
+                    response = api_request("DELETE", f"/chat/history/{conv_id}", timeout=10)
+                    if response.status_code == 200:
+                        st.toast("Chat deleted", icon="✅")
+                        if st.session_state.selected_conversation == conv_id:
+                            st.session_state.selected_conversation = None
+                            st.session_state.chat_messages = []
+                        fetch_conversations()
+                        st.rerun()
+                    else:
+                        st.error("Failed to delete chat")
+                except requests.RequestException:
+                    st.error("Could not delete chat")
 
-    st.markdown('<div class="sidebar-plan">', unsafe_allow_html=True)
-    st.markdown('<div class="plan-title">Pro Plan</div>', unsafe_allow_html=True)
-    st.caption("Unlock more capabilities and higher limits.")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="primary-button" style="margin-top: 12px;">', unsafe_allow_html=True)
-    st.button("Upgrade Now", key="upgrade_btn", use_container_width=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown("<div class='workspace-label'>Workspace</div>", unsafe_allow_html=True)
-    st.caption(f"User: {st.session_state.profile.get('username', st.session_state.get('username', 'User'))}")
-    st.caption(f"Uploads: {st.session_state.profile.get('storage_dir', 'N/A')}")
-
-left, center, right = st.columns([0.8, 3.7, 1.7])
-
-with center:
-    if st.session_state.page == "settings":
-        st.markdown('<div class="main-title">Provider settings</div>', unsafe_allow_html=True)
-        st.markdown('<div class="subtitle">Manage API keys and default models for supported providers.</div>', unsafe_allow_html=True)
-
-        try:
-            provider_response = requests.get(f"{API_BASE_URL}/settings/providers", headers=api_headers(), timeout=15)
-            provider_data = provider_response.json() if provider_response.status_code == 200 else {"providers": {}}
-        except requests.RequestException:
-            provider_data = {"providers": {}}
-
-        providers = provider_data.get("providers", {})
-        provider_names = list(providers.keys()) or ["google", "openrouter", "groq"]
-        selected_provider = st.radio("Provider", provider_names, horizontal=True, label_visibility="collapsed")
-        selected = providers.get(selected_provider, {})
-        api_key = st.text_input("API Key", value=selected.get("api_key", ""), type="password")
-        model_name = st.text_input("Model name", value=selected.get("model_name", "") or "")
-        enabled = st.checkbox("Enabled", value=bool(selected.get("enabled", True)))
-
-        if st.button("Save settings", type="primary", use_container_width=True):
-            payload = {"provider": selected_provider, "api_key": api_key, "model_name": model_name, "enabled": enabled}
-            try:
-                save_response = requests.post(f"{API_BASE_URL}/settings/providers", json=payload, headers=api_headers(), timeout=20)
-                if save_response.status_code == 200:
-                    st.success("تم حفظ إعدادات المزود")
-                else:
-                    st.error(save_response.json().get("detail", "تعذر حفظ الإعدادات"))
-            except requests.RequestException:
-                st.error("Backend غير متاح")
-
-        st.markdown('<div class="source-box" style="margin-top:18px;"><strong>Supported providers:</strong> Google, OpenRouter, Groq</div>', unsafe_allow_html=True)
-
-    elif st.session_state.page == "profile":
-        st.markdown('<div class="main-title">Profile</div>', unsafe_allow_html=True)
-        st.markdown('<div class="subtitle">User details and workspace location.</div>', unsafe_allow_html=True)
-        st.info(f"Username: {st.session_state.profile.get('username', st.session_state.get('username', 'User'))}")
-        st.info(f"Storage path: {st.session_state.profile.get('storage_dir', 'N/A')}")
-
-    else:
-        st.markdown('<div class="chat-header">', unsafe_allow_html=True)
-        st.markdown('<div class="title">What is Retrieval-Augmented Generation?</div>', unsafe_allow_html=True)
-        head_cols = st.columns([1, 1])
-        with head_cols[0]:
-            st.markdown('<div class="small-pill">Share</div>', unsafe_allow_html=True)
-        with head_cols[1]:
-            st.markdown('<div class="small-pill" style="text-align:center;">⋯</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="content-card">', unsafe_allow_html=True)
-        st.markdown('<div class="user-bubble">Can you explain what Retrieval-Augmented Generation (RAG) is and how it works? Also include a simple diagram of the pipeline.</div>', unsafe_allow_html=True)
-
-        st.markdown(
-            '<div class="assistant-bubble">Retrieval-Augmented Generation (RAG) is a technique that combines the strengths of information retrieval and text generation. It allows LLMs to access external knowledge sources before generating a response, resulting in more accurate and up-to-date answers.</div>',
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            '<div class="assistant-bubble"><strong>How it works:</strong><br>1. Retrieve: The system retrieves relevant documents from a knowledge base.<br>2. Augment: The retrieved information is provided to the language model.<br>3. Generate: The model uses both the retrieved context and its internal knowledge to generate a response.</div>',
-            unsafe_allow_html=True,
-        )
-
-        st.markdown(
-            '<div class="source-box" style="margin: 14px 0 10px;">Here is a simple diagram of the RAG pipeline:</div>',
-            unsafe_allow_html=True,
-        )
-
-        diagram_cols = st.columns([1.2, 1.2, 1.2, 1.2])
-        with diagram_cols[0]:
-            st.markdown('<div style="padding: 10px; text-align: center; border: 1px dashed #dfe7f1; border-radius: 12px; background:#f9fafb;">User query</div>', unsafe_allow_html=True)
-        with diagram_cols[1]:
-            st.markdown('<div style="padding: 10px; text-align: center; border: 1px solid #dfe7f1; border-radius: 12px; background:#ecfdf5;">Retrieve</div>', unsafe_allow_html=True)
-        with diagram_cols[2]:
-            st.markdown('<div style="padding: 10px; text-align: center; border: 1px solid #dfe7f1; border-radius: 12px; background:#f5f3ff;">Knowledge base</div>', unsafe_allow_html=True)
-        with diagram_cols[3]:
-            st.markdown('<div style="padding: 10px; text-align: center; border: 1px solid #dfe7f1; border-radius: 12px; background:#fff7ed;">LLM + Response</div>', unsafe_allow_html=True)
-
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div style="height: 14px;"></div>', unsafe_allow_html=True)
-        st.markdown('<div class="source-box"><strong>Sources</strong> · Lewis et al., 2020 (RAG) · Gao et al., 2023 · LangChain Docs · Web</div>', unsafe_allow_html=True)
-
-        st.markdown('<div style="height: 12px;"></div>', unsafe_allow_html=True)
-        action_cols = st.columns([1, 3, 1.2])
-        with action_cols[0]:
-            st.markdown('<div class="small-pill" style="text-align:center;">Upload File</div>', unsafe_allow_html=True)
-        with action_cols[1]:
-            st.markdown('<div class="small-pill" style="text-align:center;">Image</div>', unsafe_allow_html=True)
-        with action_cols[2]:
-            st.markdown('<div class="small-pill" style="text-align:center;">PDF</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="bottom-input" style="margin-top: 14px;">', unsafe_allow_html=True)
-        prompt = st.text_input("Ask anything...", label_visibility="collapsed")
-        send_cols = st.columns([5, 1])
-        with send_cols[0]:
-            st.caption("Upload File  Image  PDF  Web Link")
-        with send_cols[1]:
-            if st.button("➤", key="send_message", use_container_width=True):
-                if prompt and prompt.strip():
-                    st.session_state.chat_messages.append({"role": "user", "content": prompt.strip()})
-                    title = prompt.strip()[:40] if prompt.strip() else "New chat"
-                    cid = save_chat_message("user", prompt.strip(), st.session_state.get("conversation_id"), title=title)
-                    st.session_state.conversation_id = cid or st.session_state.get("conversation_id")
-                    try:
-                        response = requests.post(f"{API_BASE_URL}/chat", json={"question": prompt.strip(), "k": 5}, headers=api_headers(), timeout=120)
-                        if response.status_code == 200:
-                            answer = response.json().get("answer", "No answer returned.")
-                            st.session_state.chat_messages.append({"role": "assistant", "content": answer})
-                            save_chat_message("assistant", answer, st.session_state.get("conversation_id"), title=title)
-                            fetch_conversations()
-                            st.rerun()
-                        else:
-                            st.error(response.text)
-                    except requests.RequestException:
-                        st.error("API unavailable")
-                else:
-                    st.warning("اكتب سؤالاً أولًا")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-with right:
-    st.markdown('<div class="right-card">', unsafe_allow_html=True)
-    st.markdown('<div class="avatar">A</div>', unsafe_allow_html=True)
-    st.markdown(f'<div style="text-align:center; font-size: 22px; font-weight: 800; margin-bottom: 2px;">{st.session_state.profile.get("username", "Ahmed Mohamed")}</div>', unsafe_allow_html=True)
-    st.markdown('<div style="text-align:center; color:#6b7280; margin-bottom: 14px;">ahmed.mohamed@gmail.com</div>', unsafe_allow_html=True)
-    st.markdown('<div style="text-align:center; margin-bottom: 16px;"><span class="info-pill">Pro Plan</span></div>', unsafe_allow_html=True)
-
-    cols = st.columns(2)
-    with cols[0]:
-        st.markdown('<div class="stat-box"><div class="label">Conversations</div><div class="value">128</div></div>', unsafe_allow_html=True)
-    with cols[1]:
-        st.markdown('<div class="stat-box"><div class="label">Messages</div><div class="value">432</div></div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="right-menu" style="margin-top: 18px;">', unsafe_allow_html=True)
-    if st.button("Profile", key="profile_nav", use_container_width=True):
-        st.session_state.page = "profile"
+    st.markdown("<div style='margin-top: 30px;'></div>", unsafe_allow_html=True)
+    
+    # 5. Footer Actions
+    if st.button("Add API Key", use_container_width=True):
+        st.session_state.page = "api_keys"
         st.rerun()
-    if st.button("Settings", key="settings_nav", use_container_width=True):
-        st.session_state.page = "settings"
-        st.rerun()
-    if st.button("API Keys", key="api_nav", use_container_width=True):
-        st.session_state.page = "settings"
-        st.rerun()
-    if st.button("Storage", key="storage_nav", use_container_width=True):
-        st.session_state.page = "profile"
-        st.rerun()
-    if st.button("Logout", key="logout_nav", use_container_width=True):
+
+    if st.button("Logout", use_container_width=True):
+        logout_from_backend()
         st.session_state.auth_token = None
+        st.session_state.refresh_token = None
         st.session_state.username = None
+        st.session_state.page = "chat"
         st.session_state.chat_messages = []
         st.session_state.conversations = []
         st.session_state.selected_conversation = None
         st.session_state.conversation_id = None
-        st.session_state.page = "new_chat"
+        st.session_state.output_text = ""
         st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="theme-row" style="display:flex; gap:10px; margin-top: 18px;">', unsafe_allow_html=True)
-    st.button("Theme", key="theme_button")
-    st.button("☾", key="dark_button")
-    st.markdown('</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+# ==========================================
+# MAIN CONTENT VIEW
+# ==========================================
 
+# API KEYS SETTINGS PAGE
+if st.session_state.page == "api_keys":
+    st.title("API Keys Configuration")
+    try:
+        response = api_request("GET", "/settings/providers", timeout=15)
+        providers = response.json().get("providers", {}) if response.status_code == 200 else {}
+    except requests.RequestException:
+        providers = {}
+
+    provider_names = list(providers.keys()) or ["google", "openrouter", "groq"]
+    selected_provider = st.selectbox("Provider", provider_names)
+    selected = providers.get(selected_provider, {})
+    api_key = st.text_input("API Key", value="", type="password", placeholder="Leave empty to keep current key")
+    
+    if selected.get("configured"):
+        st.caption("A key is already configured.")
+        
+    model_name = st.text_input("Model Name", value=selected.get("model_name", "") or "")
+    enabled = st.checkbox("Enabled", value=bool(selected.get("enabled", True)))
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        if st.button("Save API key", type="primary", use_container_width=True):
+            payload = {"provider": selected_provider, "api_key": api_key, "model_name": model_name, "enabled": enabled}
+            try:
+                save_response = api_request("POST", "/settings/providers", json=payload, timeout=20)
+                if save_response.status_code == 200:
+                    st.success("Saved successfully")
+                else:
+                    st.error(save_response.json().get("detail", "Failed to save"))
+            except requests.RequestException:
+                st.error("Backend unavailable")
+    with col2:
+        if st.button("Back to chat", use_container_width=True):
+            st.session_state.page = "chat"
+            st.rerun()
+
+# CHAT VIEW
+else:
+    # Display Existing Conversation Messages
+    if st.session_state.selected_conversation:
+        if not st.session_state.chat_messages:
+            fetch_conversation_messages(st.session_state.selected_conversation)
+        
+        for message in st.session_state.chat_messages:
+            role = message.get("role", "assistant")
+            content = message.get("content", "")
+            if role == "user":
+                st.markdown(f'<div class="chat-bubble-user">{content}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="chat-bubble-assistant">{content}</div>', unsafe_allow_html=True)
+
+    elif not st.session_state.output_text:
+        st.markdown(
+            """
+            <div style="text-align: center; padding: 40px 20px; color: #64748b;">
+                <h3>Upload your file to begin</h3>
+                <p>The system will use it as context for the conversation.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # Output Display (For active request)
+    if st.session_state.output_text:
+        st.markdown(f'<div class="chat-bubble-assistant"><b>Output:</b><br>{st.session_state.output_text}</div>', unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Unified File Badge (If uploaded)
+    if st.session_state.last_uploaded:
+        st.markdown(
+            f'<div class="file-badge">📄 {st.session_state.last_uploaded} (in context)</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Process Status Jobs
+    for job in st.session_state.upload_jobs.values():
+        label = job.get("filename", "Uploaded document")
+        state = job.get("status", "queued")
+        if state in {"uploaded", "queued", "processing"}:
+            st.info(f"{label}: processing…")
+        elif state == "ready":
+            st.toast(f"{label}: Ready for questions", icon="✅")
+
+    # ==========================================
+    # UNIFIED COMPOSER / INPUT FORM (Issues 1 & 2 Fixed)
+    # ==========================================
+    with st.form("chat_form", clear_on_submit=False):
+        prompt = st.text_area(
+            "Message",
+            placeholder="Type your message here...",
+            label_visibility="collapsed",
+            height=80,
+        )
+
+        col_attach, col_btn = st.columns([5, 1])
+
+        with col_attach:
+            # Single Uploader for Documents and Images
+            uploaded_file = st.file_uploader(
+                "Upload Context File",
+                type=["pdf", "png", "jpg", "jpeg", "gif", "txt", "md"],
+                key=f"unified_upload_{st.session_state.upload_widget_version}",
+                label_visibility="collapsed",
+            )
+
+        with col_btn:
+            st.markdown("<div style='margin-top: 2px;'></div>", unsafe_allow_html=True)
+            submit_btn = st.form_submit_button("Send ➔", type="primary", use_container_width=True)
+
+        # File classification and automatic upload
+        is_image = False
+        is_doc = False
+
+        if uploaded_file is not None:
+            ext = uploaded_file.name.split(".")[-1].lower()
+            if ext in ["png", "jpg", "jpeg", "gif"]:
+                is_image = True
+            elif ext in ["pdf", "txt", "md"]:
+                is_doc = True
+
+        if submit_btn:
+            if not prompt or not prompt.strip():
+                st.warning("Please enter a message first")
+            else:
+                st.session_state.output_text = ""
+                st.session_state.last_sources = []
+                st.session_state.last_context_mode = "image" if is_image else "document" if is_doc else "text"
+
+                title = prompt.strip()[:40] if prompt.strip() else "New chat"
+                cid = save_chat_message("user", prompt.strip(), st.session_state.get("conversation_id"), title=title)
+                st.session_state.conversation_id = cid or st.session_state.get("conversation_id")
+                if is_doc and uploaded_file.file_id not in st.session_state.uploaded_file_ids:
+                    upload_file_to_backend(uploaded_file, st.session_state.conversation_id)
+                    st.session_state.uploaded_file_ids.add(uploaded_file.file_id)
+
+                try:
+                    with st.spinner("Processing..."):
+                        if is_image:
+                            st.info(f"📸 Sending image: {uploaded_file.name}")
+                            response = api_request(
+                                "POST", "/chat_with_image",
+                                data={"question": prompt.strip(), "k": "5", "conversation_id": st.session_state.conversation_id},
+                                files={"image": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type or "image/png")},
+                                timeout=120
+                            )
+                        else:
+                            response = api_request(
+                                "POST", "/chat",
+                                json={"question": prompt.strip(), "k": 5, "conversation_id": st.session_state.conversation_id},
+                                timeout=120
+                            )
+
+                        if response.status_code == 200:
+                            payload = response.json()
+                            answer = payload.get("answer", "No answer returned.")
+                            st.session_state.output_text = answer
+                            if is_image:
+                                st.session_state.last_sources = []
+                                st.session_state.last_context_mode = "image"
+                            else:
+                                st.session_state.last_sources = payload.get("sources", [])
+                                st.session_state.last_context_mode = "document" if st.session_state.last_sources else "text"
+                            save_chat_message("assistant", answer, cid, title=title)
+                            fetch_conversations()
+                            st.rerun()
+                        else:
+                            try:
+                                st.error(response.json().get("detail", "The request could not be completed."))
+                            except ValueError:
+                                st.error("The request could not be completed. Please try again.")
+                except requests.RequestException:
+                    st.error("API unavailable")
+
+    # Sources Citations Display
+    if st.session_state.last_context_mode != "image" and st.session_state.last_sources:
+        st.markdown("### Sources")
+        for source in st.session_state.last_sources:
+            page = source.get("page_number")
+            label = f"📖 {source.get('filename', 'Document')}{f' — page {page}' if page else ''}"
+            with st.expander(label):
+                document_id = source.get("document_id")
+                if document_id and page:
+                    try:
+                        cited_page = api_request("GET", f"/documents/{document_id}/pages/{page}", params={"conversation_id": st.session_state.conversation_id}, timeout=15)
+                        if cited_page.status_code == 200:
+                            st.write(cited_page.json().get("text", ""))
+                        else:
+                            st.caption("The cited page is no longer available.")
+                    except requests.RequestException:
+                        st.caption("Could not load the cited page.")

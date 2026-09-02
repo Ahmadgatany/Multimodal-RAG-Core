@@ -11,6 +11,7 @@ env/
 .env
 backend/.env
 backend/data/
+data/
 pip-log.txt
 
 /tmp/

@@ -62,7 +62,13 @@ From the project root, start the backend and frontend together with one command:
 python run.py
 ```
 
-The local API is available at `http://localhost:8000` and Streamlit at `http://localhost:8501`. Press `Ctrl+C` once to stop both services. Production deployments should use a process manager or containers, authentication, rate limiting, and persistent storage.
+The local API is available at `http://localhost:8000` and Streamlit at `http://localhost:8501`. Press `Ctrl+C` once to stop both services.
+
+### Production operations
+
+Run the isolated production stack (no source-code bind mounts) with `docker compose -f docker-compose.production.yml up -d --build`. Configure the required secrets and public `ALLOWED_ORIGINS` in `.env` first. The API exposes `/health` for liveness and `/ready` for database/Redis readiness; `/metrics` is authenticated and returns a small non-sensitive operational summary.
+
+Create a database-plus-upload backup with `./scripts/backup.ps1`. Install `requirements-dev.txt` and run `locust -f tests/load/locustfile.py --host http://localhost:8000 -u 30 -r 3 -t 10m` before deployment to exercise 30 concurrent chat/upload users.
 
 ### 2\. Frontend Setup (Local Machine)
 
