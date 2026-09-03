@@ -2,12 +2,12 @@
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 gunicorn==23.0.0
-python-multipart==0.0.20
+python-multipart==0.0.30
 pydantic==2.10.4
 python-dotenv==1.0.1
 requests==2.32.3
-PyJWT==2.10.1
-cryptography==44.0.0
+PyJWT==2.13.0
+cryptography==50.0.0
 redis==5.2.1
 psycopg[binary]==3.2.3
 SQLAlchemy==2.0.36
@@ -15,20 +15,20 @@ alembic==1.14.0
 
 # AI Models & Processing
 torch
-transformers==4.47.1
+transformers==5.10.0
 accelerate==1.2.1
 sentence-transformers==3.3.1
-Pillow==11.0.0
+Pillow==12.3.0
 google-genai==1.0.0
 
 # RAG & Vector Database
-langchain==0.3.13
-langchain-community==0.3.13
+langchain==0.3.30
+langchain-community==0.3.27
 langchain-huggingface==0.1.2
 faiss-cpu==1.9.0.post1
 beautifulsoup4==4.12.3
 
 # Document Loaders & OCR
-pypdf==5.1.0
+pypdf==6.14.2
 PyPDF2==3.0.1
 pytesseract==0.3.13
