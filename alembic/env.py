@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import os
+import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+
+# Alembic can be invoked from a directory other than the repository root in a
+# container. Add the project root explicitly so the backend package is found.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from backend.config import DATABASE_URL
 from backend.database import Base

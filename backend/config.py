@@ -21,6 +21,13 @@ IS_PRODUCTION = APP_ENV in {"production", "prod"}
 DATA_DIR = env_path("DATA_DIR", PROJECT_DIR / "data")
 AUTH_DB_PATH = env_path("AUTH_DB_PATH", DATA_DIR / "users.sqlite3")
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{AUTH_DB_PATH}").strip()
+# Railway's Postgres reference variable may use ``postgresql://`` while this
+# project installs the psycopg (v3) driver. Make the driver explicit so both
+# local Compose URLs and Railway reference variables work without changes.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-me-in-production-strong-secret-key-32+").strip()
 PROVIDER_ENCRYPTION_KEY = os.getenv("PROVIDER_ENCRYPTION_KEY", "").strip()
