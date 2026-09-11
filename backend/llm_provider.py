@@ -22,29 +22,36 @@ class GeminiProvider:
         self,
         prompt: str,
         image: Optional[Image.Image] = None,
-        max_output_tokens: int = 512,
+        max_output_tokens: int = 2048,
     ) -> str:
+        from google.genai import types
+
         contents = [prompt]
         if image is not None:
             image_buffer = BytesIO()
             image.save(image_buffer, format=image.format or "PNG")
             contents.append(
-                {
-                    "inline_data": {
-                        "mime_type": Image.MIME.get(image.format, "image/png"),
-                        "data": image_buffer.getvalue(),
-                    }
-                }
+                types.Part.from_bytes(
+                    data=image_buffer.getvalue(),
+                    mime_type=Image.MIME.get(image.format, "image/png"),
+                )
             )
 
         response = self.client.models.generate_content(
             model=self.model,
             contents=contents,
-            config={"max_output_tokens": max_output_tokens, "temperature": 0.2},
+            config=types.GenerateContentConfig(
+                max_output_tokens=max_output_tokens,
+                temperature=0.2,
+            ),
         )
         text = getattr(response, "text", None)
         if not text:
             raise RuntimeError("Gemini returned an empty response")
+        candidates = getattr(response, "candidates", None) or []
+        finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+        if finish_reason is not None and getattr(finish_reason, "name", str(finish_reason)) == "MAX_TOKENS":
+            raise RuntimeError("Gemini stopped because it reached the output token limit")
         return text.strip()
 
 
@@ -100,6 +107,13 @@ class OpenRouterProvider:
         if not response.ok:
             raise RuntimeError(f"OpenRouter request failed ({response.status_code}): {response.text[:500]}")
         payload = response.json()
+        if payload.get("error"):
+            error = payload["error"]
+            if isinstance(error, dict):
+                message = error.get("message") or "Unknown OpenRouter error"
+                code = error.get("code")
+                raise RuntimeError(f"OpenRouter provider error ({code}): {message}")
+            raise RuntimeError(f"OpenRouter provider error: {error}")
         try:
             text = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:

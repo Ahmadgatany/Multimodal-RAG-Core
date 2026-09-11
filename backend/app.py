@@ -70,6 +70,7 @@ try:
         validate_runtime_configuration,
         get_provider_settings,
         get_runtime_provider_config,
+        reset_provider_settings,
         save_provider_settings,
     )
 except ImportError:
@@ -126,7 +127,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 STORAGE_DIR = UPLOAD_DIR
@@ -411,7 +412,7 @@ def _init_chat_history_storage():
     with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
         connection.execute(
             "CREATE TABLE IF NOT EXISTS conversations ("
-            "id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT 'New chat', "
+            "id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT 'New Chat', "
             "created_at REAL NOT NULL, updated_at REAL NOT NULL)"
         )
         connection.execute(
@@ -449,24 +450,34 @@ def _save_chat_message(user_id: str, role: str, content: str, conversation_id: O
     _init_chat_history_storage()
     current_time = float(created_at if created_at is not None else time.time())
     if conversation_id is None:
-        conversation_id = uuid4().hex
-        if title is None:
-            title = content[:40].strip() or "New chat"
-        with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
-            connection.execute(
-                "INSERT INTO conversations (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (conversation_id, user_id, title, current_time, current_time),
-            )
+        conversation_id = _create_conversation(user_id, title or content[:40].strip() or "New Chat", current_time)
 
     message_id = uuid4().hex
     with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
         connection.execute(
             "INSERT INTO messages (id, conversation_id, user_id, role, content, created_at, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (message_id, conversation_id, user_id, role, content, current_time, json.dumps({"title": title or "New chat"})),
+            (message_id, conversation_id, user_id, role, content, current_time, json.dumps({"title": title or "New Chat"})),
         )
+        if title and role == "user":
+            connection.execute(
+                "UPDATE conversations SET title = ? WHERE id = ? AND title = 'New Chat'",
+                (title.strip(), conversation_id),
+            )
         connection.execute(
             "UPDATE conversations SET updated_at = ? WHERE id = ?",
             (current_time, conversation_id),
+        )
+    return conversation_id
+
+
+def _create_conversation(user_id: str, title: str = "New Chat", created_at: Optional[float] = None):
+    _init_chat_history_storage()
+    current_time = float(created_at if created_at is not None else time.time())
+    conversation_id = uuid4().hex
+    with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
+        connection.execute(
+            "INSERT INTO conversations (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (conversation_id, user_id, title, current_time, current_time),
         )
     return conversation_id
 
@@ -794,6 +805,14 @@ def save_provider_settings_route(payload: ProviderSettingsRequest, authorization
     return {"provider": provider_name, "saved": True, "configured": get_provider_settings(user_id)[provider_name]["configured"]}
 
 
+@app.post("/settings/providers/reset")
+def reset_provider_settings_route(authorization: Optional[str] = Header(None)):
+    user_id = _current_user(authorization)
+    reset_provider_settings(user_id)
+    runtime = get_runtime_provider_config(user_id)
+    return {"provider": runtime["provider"], "model": runtime["model"], "reset": True}
+
+
 @app.post("/auth/logout")
 def logout(authorization: Optional[str] = Header(None), refresh_token: Optional[str] = None):
     if not authorization or not authorization.startswith("Bearer "):
@@ -985,13 +1004,15 @@ def get_document_page(document_id: str, page_number: int, conversation_id: str =
 
 
 @app.post("/upload_file", status_code=status.HTTP_202_ACCEPTED)
-async def upload_file(background_tasks: BackgroundTasks, conversation_id: str = Form(...), file: UploadFile = File(...), authorization: Optional[str] = Header(None)):
+async def upload_file(background_tasks: BackgroundTasks, conversation_id: Optional[str] = Form(None), file: UploadFile = File(...), authorization: Optional[str] = Header(None)):
     """Accept PDF or image uploads. Extract text and add to agent's docs.
     Returns path and a short message. Multiple uploads can be sent in sequence.
     """
     user_id = _current_user(authorization)
-    if not _conversation_exists(user_id, conversation_id):
+    if conversation_id is not None and not _conversation_exists(user_id, conversation_id):
         raise HTTPException(404, "Conversation not found")
+    if conversation_id is None:
+        conversation_id = _create_conversation(user_id)
     _enforce_rate_limit("upload", user_id, UPLOAD_RATE_LIMIT)
     agent = _get_agent(user_id, conversation_id)
 
@@ -1035,7 +1056,7 @@ async def upload_file(background_tasks: BackgroundTasks, conversation_id: str = 
 
     document_id = agent.create_ingestion_job(filename)
     background_tasks.add_task(_ingest_file, user_id, conversation_id, document_id, str(out_path))
-    return {"message": "File uploaded and processing will start shortly.", "document_id": document_id, "status": "uploaded"}
+    return {"message": "File uploaded and processing will start shortly.", "conversation_id": conversation_id, "document_id": document_id, "status": "uploaded"}
 
 @app.post("/chat")
 def chat(request: QueryRequest, authorization: Optional[str] = Header(None)):
@@ -1052,7 +1073,7 @@ def chat(request: QueryRequest, authorization: Optional[str] = Header(None)):
         return agent.answer_with_sources(request.question, k=request.k)
     except Exception as error:
         logger.exception(json.dumps({"event": "chat_model_failed", "user_id": user_id, "error_type": type(error).__name__}))
-        raise HTTPException(502, "The model request failed") from error
+        raise HTTPException(502, f"The model request failed: {str(error)[:300]}") from error
 
 
 @app.post("/chat_with_image")
@@ -1080,13 +1101,14 @@ async def chat_with_image(
             raise HTTPException(415, "Failed to process image") from error
 
     try:
+        runtime_config = get_runtime_provider_config(user_id)
         with _metrics_lock:
             _metrics["llm_requests"] += 1
-            _metrics["llm_by_provider"][LLM_PROVIDER] += 1
+            _metrics["llm_by_provider"][runtime_config["provider"]] += 1
         return agent.answer_with_sources(question, image=img_data, k=k or 5)
     except Exception as error:
-        logger.exception(json.dumps({"event": "image_chat_model_failed", "user_id": user_id, "error_type": type(error).__name__}))
-        raise HTTPException(502, "The model request failed") from error
+        logger.exception(json.dumps({"event": "image_chat_model_failed", "user_id": user_id, "provider": runtime_config.get("provider", "unknown") if "runtime_config" in locals() else "unknown", "model": runtime_config.get("model", "unknown") if "runtime_config" in locals() else "unknown", "error_type": type(error).__name__, "error": str(error)[:500]}))
+        raise HTTPException(502, f"The model request failed: {type(error).__name__}") from error
 
 @app.post("/summarize")
 def summarize(conversation_id: str = Query(...), authorization: Optional[str] = Header(None)):

@@ -3,6 +3,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from shutil import which
 from pathlib import Path
 
 
@@ -36,12 +37,15 @@ def main() -> None:
             )
             wait_for_backend()
 
+        npm = which("npm") or which("npm.cmd")
+        if not npm:
+            raise RuntimeError("Node.js and npm are required to start the Next.js frontend")
         frontend = subprocess.Popen(
-            [sys.executable, "-m", "streamlit", "run", "frontend/app.py", "--server.headless", "true", "--server.port", "8501"],
-            cwd=ROOT_DIR,
+            [npm, "run", "dev", "--", "--hostname", "127.0.0.1", "--port", "3000"],
+            cwd=ROOT_DIR / "frontend",
         )
         print("Backend: http://127.0.0.1:8000")
-        print("Frontend: http://localhost:8501")
+        print("Frontend: http://localhost:3000")
         frontend.wait()
     except KeyboardInterrupt:
         print("Stopping services...")

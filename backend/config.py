@@ -63,7 +63,7 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 LOGIN_RATE_LIMIT = int(os.getenv("LOGIN_RATE_LIMIT", "10"))
 CHAT_RATE_LIMIT = int(os.getenv("CHAT_RATE_LIMIT", "30"))
 UPLOAD_RATE_LIMIT = int(os.getenv("UPLOAD_RATE_LIMIT", "10"))
-ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:8501").split(",") if origin.strip()]
+ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if origin.strip()]
 SUPPORTED_PROVIDERS = [
     provider.strip().lower()
     for provider in os.getenv("SUPPORTED_PROVIDERS", "google,openrouter,groq").split(",")
@@ -145,11 +145,19 @@ def save_provider_settings(user_id: str, provider: str, api_key: str, model_name
         existing = conn.execute("SELECT api_key_encrypted FROM user_provider_settings WHERE user_id=? AND provider=?", (user_id, provider)).fetchone()
         if encrypted_key is None and existing:
             encrypted_key = existing[0]
+        if enabled:
+            conn.execute("UPDATE user_provider_settings SET enabled=0 WHERE user_id=? AND provider<>?", (user_id, provider))
         conn.execute(
             "INSERT INTO user_provider_settings (user_id, provider, api_key_encrypted, model_name, enabled, updated_at) VALUES (?, ?, ?, ?, ?, strftime('%s','now')) "
             "ON CONFLICT(user_id, provider) DO UPDATE SET api_key_encrypted=excluded.api_key_encrypted, model_name=excluded.model_name, enabled=excluded.enabled, updated_at=excluded.updated_at",
             (user_id, provider, encrypted_key, model_name, int(enabled)),
         )
+
+
+def reset_provider_settings(user_id: str) -> None:
+    _init_provider_settings_db()
+    with sqlite3.connect(PROVIDER_SETTINGS_DB_PATH) as conn:
+        conn.execute("UPDATE user_provider_settings SET enabled=0 WHERE user_id=?", (user_id,))
 
 
 def get_runtime_provider_config(user_id: str | None = None):
@@ -158,7 +166,13 @@ def get_runtime_provider_config(user_id: str | None = None):
     selected: dict[str, object] = {}
     if user_id:
         with sqlite3.connect(PROVIDER_SETTINGS_DB_PATH) as conn:
-            row = conn.execute("SELECT api_key_encrypted, model_name, enabled FROM user_provider_settings WHERE user_id=? AND provider=?", (user_id, provider_name)).fetchone()
+            rows = conn.execute("SELECT provider, api_key_encrypted, model_name, enabled FROM user_provider_settings WHERE user_id=? ORDER BY updated_at DESC", (user_id,)).fetchall()
+        active_row = next((item for item in rows if item[3]), None)
+        if active_row:
+            provider_name = active_row[0]
+            row = active_row[1:]
+        else:
+            row = None
         if row:
             try:
                 api_key = _cipher().decrypt(row[0].encode("ascii")).decode("utf-8") if row[0] else ""

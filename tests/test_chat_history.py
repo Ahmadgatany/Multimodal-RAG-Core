@@ -25,3 +25,23 @@ def test_chat_history_is_pruned_after_retention_window():
         rows = connection.execute("SELECT COUNT(*) FROM messages WHERE conversation_id = ?", (conversation_id,)).fetchone()[0]
 
     assert rows == 0
+
+
+def test_first_user_message_names_existing_new_chat(tmp_path):
+    backend_app.CHAT_HISTORY_DB_PATH = tmp_path / "chat_history.sqlite3"
+
+    conversation_id = backend_app._create_conversation("user-123")
+    backend_app._save_chat_message(
+        user_id="user-123",
+        role="user",
+        content="How does retrieval work?",
+        conversation_id=conversation_id,
+        title="How does",
+    )
+
+    with sqlite3.connect(backend_app.CHAT_HISTORY_DB_PATH) as connection:
+        title = connection.execute(
+            "SELECT title FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()[0]
+
+    assert title == "How does"

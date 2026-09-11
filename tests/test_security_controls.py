@@ -25,6 +25,36 @@ def test_provider_settings_are_per_user_and_never_return_plaintext(tmp_path, mon
     assert config.get_runtime_provider_config("user-a")["api_key"] == "secret-for-user-a"
 
 
+def test_user_selected_provider_overrides_global_provider(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PROVIDER_SETTINGS_DB_PATH", tmp_path / "provider_settings.sqlite3")
+    monkeypatch.setattr(config, "LLM_PROVIDER", "openrouter")
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "global-openrouter-key")
+    config.save_provider_settings("user-a", "openrouter", "openrouter-key", "openrouter/model", True)
+    config.save_provider_settings("user-a", "google", "google-key", "gemini-3.6-flash", True)
+
+    runtime = config.get_runtime_provider_config("user-a")
+
+    assert runtime["provider"] == "google"
+    assert runtime["api_key"] == "google-key"
+    assert runtime["model"] == "gemini-3.6-flash"
+    assert config.get_provider_settings("user-a")["openrouter"]["enabled"] is False
+
+
+def test_reset_provider_settings_uses_global_defaults(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "PROVIDER_SETTINGS_DB_PATH", tmp_path / "provider_settings.sqlite3")
+    monkeypatch.setattr(config, "LLM_PROVIDER", "openrouter")
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "global-openrouter-key")
+    monkeypatch.setattr(config, "OPENROUTER_MODEL", "thinkingmachines/inkling:free")
+    config.save_provider_settings("user-a", "google", "google-key", "gemini-3.6-flash", True)
+
+    config.reset_provider_settings("user-a")
+
+    runtime = config.get_runtime_provider_config("user-a")
+    assert runtime["provider"] == "openrouter"
+    assert runtime["model"] == "thinkingmachines/inkling:free"
+    assert runtime["api_key"] == "global-openrouter-key"
+
+
 def test_in_memory_rate_limit_rejects_over_limit(monkeypatch):
     backend_app._rate_limit_events.clear()
     monkeypatch.setattr(backend_app, "redis_client", None)

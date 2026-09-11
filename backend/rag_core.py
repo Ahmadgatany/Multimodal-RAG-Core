@@ -12,10 +12,10 @@ from PIL import Image
 import requests
 
 try:
-    from .config import DB_PATH, EMBEDDING_MODEL, EMBEDDING_PROVIDER, UPLOAD_DIR, USE_VECTOR_DB, get_runtime_provider_config
+    from .config import DB_PATH, EMBEDDING_MODEL, EMBEDDING_PROVIDER, GOOGLE_API_KEY, OPENROUTER_API_KEY, OPENROUTER_APP_NAME, OPENROUTER_SITE_URL, UPLOAD_DIR, USE_VECTOR_DB, get_runtime_provider_config
     from .llm_provider import GeminiProvider, OpenRouterProvider
 except ImportError:  # pragma: no cover
-    from config import DB_PATH, EMBEDDING_MODEL, EMBEDDING_PROVIDER, UPLOAD_DIR, USE_VECTOR_DB, get_runtime_provider_config
+    from config import DB_PATH, EMBEDDING_MODEL, EMBEDDING_PROVIDER, GOOGLE_API_KEY, OPENROUTER_API_KEY, OPENROUTER_APP_NAME, OPENROUTER_SITE_URL, UPLOAD_DIR, USE_VECTOR_DB, get_runtime_provider_config
     from llm_provider import GeminiProvider, OpenRouterProvider
 
 try:
@@ -66,6 +66,32 @@ class OpenRouterEmbeddings(Embeddings):
         return self._embed([text])[0]
 
 
+class GeminiEmbeddings(Embeddings):
+    """LangChain-compatible adapter for Gemini embedding models."""
+
+    def __init__(self, api_key: str, model: str):
+        if not api_key:
+            raise RuntimeError("Gemini embeddings require GOOGLE_API_KEY")
+        from google import genai
+
+        self.client = genai.Client(api_key=api_key)
+        self.model = model
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        response = self.client.models.embed_content(model=self.model, contents=texts)
+        embeddings = getattr(response, "embeddings", None) or []
+        vectors = [getattr(item, "values", None) for item in embeddings]
+        if len(vectors) != len(texts) or any(vector is None for vector in vectors):
+            raise RuntimeError("Gemini returned an incomplete embeddings response")
+        return vectors
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [vector for offset in range(0, len(texts), 64) for vector in self._embed(texts[offset:offset + 64])]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed([text])[0]
+
+
 class RAGCore:
     """Per-user persistent document store and retrieval pipeline."""
 
@@ -88,9 +114,9 @@ class RAGCore:
 
     def _init_storage(self) -> None:
         with self._connection() as connection:
-            connection.execute("CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY AUTOINCREMENT, document_id TEXT, source TEXT NOT NULL, page_number INTEGER, text TEXT NOT NULL, content_hash TEXT, created_at REAL NOT NULL DEFAULT 0)")
+            connection.execute("CREATE TABLE IF NOT EXISTS documents (id INTEGER PRIMARY KEY AUTOINCREMENT, document_id TEXT, source TEXT NOT NULL, page_number INTEGER, text TEXT NOT NULL, content_hash TEXT, created_at REAL NOT NULL DEFAULT 0, file_path TEXT)")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
-            for name, definition in (("document_id", "TEXT"), ("page_number", "INTEGER"), ("content_hash", "TEXT"), ("created_at", "REAL NOT NULL DEFAULT 0")):
+            for name, definition in (("document_id", "TEXT"), ("page_number", "INTEGER"), ("content_hash", "TEXT"), ("created_at", "REAL NOT NULL DEFAULT 0"), ("file_path", "TEXT")):
                 if name not in columns:
                     connection.execute(f"ALTER TABLE documents ADD COLUMN {name} {definition}")
             connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_document_id ON documents(document_id)")
@@ -98,18 +124,23 @@ class RAGCore:
 
     def _embeddings_client(self):
         if self._embeddings is None:
-            if EMBEDDING_PROVIDER == "openrouter":
+            if EMBEDDING_PROVIDER == "gemini":
+                self._embeddings = GeminiEmbeddings(api_key=GOOGLE_API_KEY or "", model=self.embedding_model)
+            elif EMBEDDING_PROVIDER == "openrouter":
                 config = get_runtime_provider_config(self.user_id)
-                if config["provider"] != "openrouter" or not config["api_key"]:
-                    raise RuntimeError("OpenRouter embeddings require an active OpenRouter API key")
+                embedding_api_key = OPENROUTER_API_KEY
+                if config["provider"] == "openrouter" and config["api_key"]:
+                    embedding_api_key = config["api_key"]
+                if not embedding_api_key:
+                    raise RuntimeError("OpenRouter embeddings require an OpenRouter API key")
                 self._embeddings = OpenRouterEmbeddings(
-                    api_key=config["api_key"], model=self.embedding_model,
-                    site_url=config.get("site_url", ""), app_name=config.get("app_name", ""),
+                    api_key=embedding_api_key, model=self.embedding_model,
+                    site_url=OPENROUTER_SITE_URL, app_name=OPENROUTER_APP_NAME,
                 )
             elif EMBEDDING_PROVIDER == "local":
                 self._embeddings = HuggingFaceEmbeddings(model_name=self.embedding_model)
             else:
-                raise RuntimeError("EMBEDDING_PROVIDER must be 'local' or 'openrouter'")
+                raise RuntimeError("EMBEDDING_PROVIDER must be 'local', 'gemini', or 'openrouter'")
         return self._embeddings
 
     def _load_vector_db(self) -> None:
@@ -144,13 +175,13 @@ class RAGCore:
     def get_document_page(self, document_id: str, page_number: int) -> Optional[dict[str, Any]]:
         """Return extracted text for a cited page, scoped to this user's store."""
         with self._connection() as connection:
-            row = connection.execute(
+            rows = connection.execute(
                 "SELECT source, page_number, text FROM documents WHERE document_id=? AND page_number=? LIMIT 1",
                 (document_id, page_number),
             ).fetchone()
-        if not row:
+        if not rows:
             return None
-        return {"filename": Path(row[0]).name, "page_number": row[1], "text": row[2]}
+        return {"filename": Path(rows[0]).name, "page_number": rows[1], "text": rows[2]}
 
     def _add_doc(self, document_id: str, source: str, text: str, page_number: Optional[int] = None) -> bool:
         text = text.strip()
@@ -169,7 +200,10 @@ class RAGCore:
         return sum(self._add_doc(document_id, pdf_path, page.extract_text() or "", index) for index, page in enumerate(reader.pages, start=1))
 
     def _add_image(self, document_id: str, image_path: str) -> int:
-        text = pytesseract.image_to_string(Image.open(image_path)) if OCR_AVAILABLE else ""
+        try:
+            text = pytesseract.image_to_string(Image.open(image_path)) if OCR_AVAILABLE else ""
+        except Exception:
+            text = ""
         return int(self._add_doc(document_id, image_path, text or "[Image uploaded; no OCR text was detected.]", 1))
 
     def _add_text(self, document_id: str, text_path: str) -> int:
@@ -182,11 +216,17 @@ class RAGCore:
             count = self._add_pdf(document_id, path) if suffix == ".pdf" else self._add_image(document_id, path) if suffix in {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"} else self._add_text(document_id, path)
             if not count:
                 raise ValueError("No extractable content was found in this file")
+            with self._connection() as connection:
+                connection.execute("UPDATE documents SET file_path=? WHERE document_id=?", (str(Path(path).resolve()), document_id))
             if display_name:
                 with self._connection() as connection:
                     connection.execute("UPDATE documents SET source=? WHERE document_id=?", (Path(display_name).name, document_id))
-            self.build_vector_db()
-            self._set_job(document_id, "ready", f"Indexed {count} page(s)/section(s)")
+            detail = f"Indexed {count} page(s)/section(s)"
+            try:
+                self.build_vector_db()
+            except Exception as error:
+                detail = f"Stored {count} page(s)/section(s); vector indexing unavailable: {str(error)[:200]}"
+            self._set_job(document_id, "ready", detail)
         except Exception as error:
             self._set_job(document_id, "failed", str(error)[:500])
 
@@ -194,6 +234,26 @@ class RAGCore:
         with self._connection() as connection:
             rows = connection.execute("SELECT document_id, source, page_number, text FROM documents ORDER BY id").fetchall()
         return [dict(zip(("document_id", "source", "page_number", "text"), row)) for row in rows]
+
+    def _latest_image(self) -> Optional[Image.Image]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT file_path FROM documents WHERE file_path IS NOT NULL AND lower(file_path) GLOB '*.*' ORDER BY created_at DESC"
+            ).fetchall()
+        image_suffixes = {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"}
+        image_paths = [Path(row[0]) for row in rows if Path(row[0]).suffix.lower() in image_suffixes]
+        if not image_paths:
+            image_paths = sorted(
+                (path for path in self.upload_dir.rglob("*") if path.is_file() and path.suffix.lower() in image_suffixes),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        if not image_paths:
+            return None
+        try:
+            return Image.open(image_paths[0])
+        except (OSError, ValueError):
+            return None
 
     def build_vector_db(self, chunk_size: int = 900, chunk_overlap: int = 120) -> None:
         if not self.use_vector_db:
@@ -214,8 +274,11 @@ class RAGCore:
     def retrieve(self, query: str, k: int = 5) -> list[dict[str, Any]]:
         candidates = []
         if self.vector_db is not None:
-            for document, distance in self.vector_db.similarity_search_with_score(query, k=max(k * 3, 10)):
-                candidates.append({"text": document.page_content, **document.metadata, "semantic_score": float(distance)})
+            try:
+                for document, distance in self.vector_db.similarity_search_with_score(query, k=max(k * 3, 10)):
+                    candidates.append({"text": document.page_content, **document.metadata, "semantic_score": float(distance)})
+            except Exception:
+                self.vector_db = None
         if not candidates:
             candidates = self._records()
         terms = self._tokens(query)
@@ -232,22 +295,34 @@ class RAGCore:
             return OpenRouterProvider(config["api_key"], config["model"], config["site_url"], config["app_name"])
         raise RuntimeError(f"Unsupported LLM provider: {config['provider']}")
 
-    def generate_text(self, messages: list[dict[str, str]] | str, image: Optional[Image.Image] = None, max_new_tokens: int = 512) -> str:
+    def generate_text(self, messages: list[dict[str, str]] | str, image: Optional[Image.Image] = None, max_new_tokens: int = 2048) -> str:
         prompt = messages if isinstance(messages, str) else "\n\n".join(f"{item['role'].upper()}: {item['content']}" for item in messages)
         return self._provider().generate(prompt, image=image, max_output_tokens=max_new_tokens)
 
     def answer_with_sources(self, question: str, image: Optional[Image.Image] = None, k: int = 5) -> dict[str, Any]:
+        image = image or self._latest_image()
+        format_instruction = ""
+        if "4" in question and ("سطر" in question or "سطور" in question or "line" in question.lower()):
+            format_instruction = "\n\nأجب في 4 أسطر فقط، واجعل كل سطر جملة مفيدة ومكتملة. لا تقطع الجملة ولا تضف مقدمة أو خاتمة."
         if image is not None:
-            return {"answer": self.generate_text([{"role": "user", "content": f"Answer the question from this image: {question}"}], image=image), "sources": []}
+            prompt = (
+                "You are an invoice/document vision assistant. Answer the user's question using the uploaded image. "
+                "Inspect the invoice itself, not general meanings of the words in the question. "
+                "For questions asking who the invoice is from and to whom, identify the sender/supplier and recipient/customer "
+                "exactly as written on the invoice. If a field is unreadable or absent, say that clearly. "
+                "Answer in the same language as the user and do not invent details.\n\n"
+                f"User question: {question}{format_instruction}"
+            )
+            return {"answer": self.generate_text([{"role": "user", "content": prompt}], image=image), "sources": []}
         records = self._records()
         matches = self.retrieve(question, k) if records else []
         if records and not matches:
             return {"answer": "I could not find enough information in your uploaded documents to answer that question.", "sources": []}
         if matches:
             context = "\n\n".join(f"[Source: {Path(item['source']).name}, page {item.get('page_number') or 'N/A'}]\n{item['text']}" for item in matches)
-            messages = [{"role": "system", "content": "Answer only from the supplied context. If it is insufficient, say so clearly. Do not invent facts."}, {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}]
+            messages = [{"role": "system", "content": "Answer only from the supplied context. If it is insufficient, say so clearly. Do not invent facts."}, {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}{format_instruction}"}]
         else:
-            messages = [{"role": "user", "content": question}]
+            messages = [{"role": "user", "content": f"{question}{format_instruction}"}]
         answer = self.generate_text(messages)
         seen, sources = set(), []
         for item in matches:
