@@ -26,7 +26,7 @@ Extract, chunk, and retrieve relevant content
 Generate an answer with source metadata
 ```
 
-Each account receives **one server-provided free question**. Afterwards, the application guides the user to Model Settings to add and enable their own API key.
+Each Google account receives one server-provided free question. Additional usage requires the user to configure their own supported API key.
 
 ## Architecture
 
@@ -43,7 +43,7 @@ Each account receives **one server-provided free question**. Afterwards, the app
         │                       │
 ┌───────▼────────┐     ┌────────▼──────────────┐
 │ PostgreSQL      │     │ Conversation RAG store │
-│ users/sessions  │     │ SQLite + optional FAISS│
+│ users/sessions  │     │ SQLite + FAISS         │
 └────────────────┘     └────────┬──────────────┘
                                  │
                    ┌─────────────▼─────────────┐
@@ -57,7 +57,7 @@ Conversation data is persisted independently at:
 <UPLOAD_DIR>/<user_id>/conversations/<conversation_id>/
 ├── uploads/
 ├── rag.sqlite3
-└── faiss_index/                 # created when vector search is enabled
+└── faiss_index/                 # vector search index
 ```
 
 ## Core capabilities
@@ -68,7 +68,7 @@ Conversation data is persisted independently at:
 | Conversations | Saved history, isolated documents, and per-conversation retrieval |
 | Files | PDF, TXT, Markdown, PNG, JPG/JPEG, TIFF, BMP, and GIF |
 | Extraction | PDF text extraction and optional Tesseract OCR for images |
-| Retrieval | SQLite-backed chunks with optional FAISS vector search |
+| Retrieval | SQLite-backed chunks with FAISS vector search |
 | Models | Google Gemini and OpenRouter; text and image prompts |
 | User model settings | Encrypted, per-user API keys with provider/model selection and enablement |
 | Operational safety | File-size cap, rate limits, ownership checks, readiness and metrics endpoints |
@@ -226,13 +226,34 @@ Create four Railway services: **backend**, **frontend**, **PostgreSQL**, and **R
 | Frontend | Root directory `/frontend`; build `npm run build`; start `npm start` |
 | PostgreSQL / Redis | Use Railway-managed services and reference variables |
 
-Attach a persistent backend volume at `/app/data` to retain uploaded files, SQLite RAG stores, and FAISS indexes. Set `NEXT_PUBLIC_API_URL` to the backend's public HTTPS address, and set the exact frontend HTTPS origin in `ALLOWED_ORIGINS`. Rebuild the frontend after changing `NEXT_PUBLIC_API_URL` because Next.js exposes it at build time.
+Attach a persistent backend volume at `/app/data` to retain uploaded files, SQLite RAG stores, and FAISS indexes. `NEXT_PUBLIC_API_URL` must point to the public Backend/API HTTPS URL. Configure `ALLOWED_ORIGINS` with the exact public Frontend HTTPS origin. Rebuild the frontend after changing `NEXT_PUBLIC_API_URL` because Next.js exposes it at build time.
 
 ### Current hosted deployment
 
-[Open the deployed application](https://multimodal-rag-core-production-4615.up.railway.app/)
+**Public Frontend URL:** [Open the deployed application](https://multimodal-rag-core-production-4615.up.railway.app/)
 
-Hosted on Railway. Availability may be temporary through October 14, 2026.
+**Public Backend/API URL:** `<RAILWAY_BACKEND_HTTPS_URL>`
+
+> Currently hosted on Railway. Availability may be temporary.
+
+The exact production Backend/API URL is not stored in this repository. After the Railway backend service is deployed, use its public HTTPS URL for `NEXT_PUBLIC_API_URL`; use the exact public Frontend HTTPS origin for `ALLOWED_ORIGINS`. The Google OAuth Client ID and origin/redirect configuration can be completed after both production URLs are available; no redirect URI is assumed here.
+
+### Usage evidence
+
+The private `GET /metrics` endpoint reports persistent production usage data without exposing message content or provider secrets. Configure `ADMIN_METRICS_TOKEN` in Railway and send it as the `X-Metrics-Token` header; never commit or place this token in a URL.
+
+- `total_users` — registered users
+- `users_with_login` — users who have completed a login
+- `active_users_24h` — users seen during the last 24 hours
+- `conversations` and `messages` — stored chat activity
+
+User records also keep `created_at`, `last_login_at`, `last_seen_at`, and `login_count`. The Railway entrypoint runs `alembic upgrade head` before starting the API, so these fields are migrated automatically.
+
+From Git Bash, retrieve the private report with:
+
+```bash
+curl -H "X-Metrics-Token: $ADMIN_METRICS_TOKEN" <RAILWAY_BACKEND_HTTPS_URL>/metrics
+```
 
 ## Verification and testing
 

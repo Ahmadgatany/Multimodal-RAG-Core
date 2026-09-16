@@ -39,6 +39,7 @@ JWT_ACCESS_TOKEN_TTL_SECONDS = int(os.getenv("JWT_ACCESS_TOKEN_TTL_SECONDS", "36
 JWT_REFRESH_TOKEN_TTL_SECONDS = int(os.getenv("JWT_REFRESH_TOKEN_TTL_SECONDS", "604800"))
 AUTH_BACKEND = os.getenv("AUTH_BACKEND", "jwt").strip().lower()
 GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "").strip()
+ADMIN_METRICS_TOKEN = os.getenv("ADMIN_METRICS_TOKEN", "").strip()
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -101,6 +102,8 @@ def validate_runtime_configuration() -> None:
         raise RuntimeError("PROVIDER_ENCRYPTION_KEY must be a valid Fernet key in production") from error
     if not REDIS_URL:
         raise RuntimeError("REDIS_URL is required in production")
+    if len(ADMIN_METRICS_TOKEN) < 32:
+        raise RuntimeError("ADMIN_METRICS_TOKEN must be set to a secret of at least 32 characters in production")
     if "*" in ALLOWED_ORIGINS:
         raise RuntimeError("ALLOWED_ORIGINS cannot contain '*' in production")
 

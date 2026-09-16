@@ -48,6 +48,7 @@ try:
     from .config import (
         AGENT_CACHE_SIZE,
         ALLOWED_ORIGINS,
+        ADMIN_METRICS_TOKEN,
         ALLOWED_EXTENSIONS,
         AUTH_BACKEND,
         AUTH_DB_PATH,
@@ -86,6 +87,7 @@ except ImportError:
     from config import (
         AGENT_CACHE_SIZE,
         ALLOWED_ORIGINS,
+        ADMIN_METRICS_TOKEN,
         ALLOWED_EXTENSIONS,
         AUTH_BACKEND,
         AUTH_DB_PATH,
@@ -151,6 +153,7 @@ _rate_limit_events: dict[str, deque[float]] = defaultdict(deque)
 _rate_limit_lock = Lock()
 _metrics_lock = Lock()
 _metrics: dict[str, Any] = {"requests": 0, "errors": 0, "response_ms_total": 0.0, "llm_requests": 0, "llm_by_provider": defaultdict(int)}
+_activity_write_at: dict[str, float] = {}
 
 if REDIS_URL and redis is not None:
     try:
@@ -311,6 +314,47 @@ def _safe_db_session():
         return SessionLocal()
     except Exception:
         return None
+
+
+def _record_user_login(user_id: str) -> None:
+    db = _safe_db_session()
+    if db is None or User is None:
+        return
+    now = datetime.utcnow()
+    try:
+        db.query(User).filter(User.id == user_id).update(
+            {
+                User.last_login_at: now,
+                User.last_seen_at: now,
+                User.login_count: User.login_count + 1,
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _record_user_activity(user_id: str) -> None:
+    now = time.time()
+    if now - _activity_write_at.get(user_id, 0.0) < 300:
+        return
+    db = _safe_db_session()
+    if db is None or User is None:
+        return
+    try:
+        db.query(User).filter(User.id == user_id).update(
+            {User.last_seen_at: datetime.utcnow()},
+            synchronize_session=False,
+        )
+        db.commit()
+        _activity_write_at[user_id] = now
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _store_revoked_jti(jti: str, user_id: Optional[str], token_type: str = "access", reason: Optional[str] = None):
@@ -597,6 +641,12 @@ def _init_auth_storage():
                 connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users (email)")
             if "trial_questions_used" not in columns:
                 connection.exec_driver_sql("ALTER TABLE users ADD COLUMN trial_questions_used INTEGER NOT NULL DEFAULT 0")
+            if "last_login_at" not in columns:
+                connection.exec_driver_sql("ALTER TABLE users ADD COLUMN last_login_at DATETIME")
+            if "last_seen_at" not in columns:
+                connection.exec_driver_sql("ALTER TABLE users ADD COLUMN last_seen_at DATETIME")
+            if "login_count" not in columns:
+                connection.exec_driver_sql("ALTER TABLE users ADD COLUMN login_count INTEGER NOT NULL DEFAULT 0")
 
 
 def _hash_password(password: str, salt: bytes | None = None) -> str:
@@ -635,6 +685,7 @@ def _current_user(authorization: Optional[str]) -> str:
         current_record["last_seen"] = time.time()
         sessions.move_to_end(token)
 
+    _record_user_activity(user_id)
     return user_id
 
 
@@ -710,6 +761,7 @@ def _issue_session(user: User) -> dict[str, Any]:
     refresh_token = create_refresh_token(user.id)
     _store_session_token(token, user.id)
     _store_refresh_token_record(user.id, refresh_token)
+    _record_user_login(user.id)
     _prune_chat_history()
     return {
         "token": token,
@@ -1057,14 +1109,38 @@ def readiness():
     return {"status": "ready", "checks": checks}
 
 
+def _require_metrics_access(metrics_token: Optional[str]) -> None:
+    if not ADMIN_METRICS_TOKEN or not metrics_token or not secrets.compare_digest(metrics_token, ADMIN_METRICS_TOKEN):
+        raise HTTPException(403, "Metrics access is restricted")
+
+
 @app.get("/metrics")
-def metrics(authorization: Optional[str] = Header(None)):
-    """Authenticated operational summary; values intentionally exclude secrets."""
-    _current_user(authorization)
+def metrics(metrics_token: Optional[str] = Header(None, alias="X-Metrics-Token")):
+    """Private operational summary; values intentionally exclude secrets."""
+    _require_metrics_access(metrics_token)
     with _metrics_lock:
         snapshot = dict(_metrics)
     request_count = snapshot["requests"]
+    usage = {"total_users": 0, "users_with_login": 0, "active_users_24h": 0, "conversations": 0, "messages": 0}
+    db = _safe_db_session()
+    if db is not None and User is not None:
+        try:
+            day_ago = datetime.utcnow() - timedelta(days=1)
+            usage.update(
+                {
+                    "total_users": db.query(User).count(),
+                    "users_with_login": db.query(User).filter(User.last_login_at.isnot(None)).count(),
+                    "active_users_24h": db.query(User).filter(User.last_seen_at >= day_ago).count(),
+                }
+            )
+        finally:
+            db.close()
+    _init_chat_history_storage()
+    with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
+        usage["conversations"] = connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+        usage["messages"] = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     return {
+        **usage,
         "requests": request_count,
         "errors": snapshot["errors"],
         "average_response_ms": round(snapshot["response_ms_total"] / request_count, 1) if request_count else 0,
