@@ -1,42 +1,57 @@
 # Multimodal RAG Core
 
-Multimodal RAG Core is a document question-answering application. Upload a PDF, text file, Markdown file, or image, then ask questions in a conversation. The application retrieves relevant content from the files in that conversation and sends it to a configured AI model to produce an answer with source references.
+> A production-oriented, multilingual document intelligence application. Upload a document, ask a question, and receive grounded answers from the content of that conversation.
 
-The project has a FastAPI backend and a Next.js frontend. It supports Arabic and English user interfaces and responses.
+**Multimodal RAG Core** combines a Next.js client with a FastAPI retrieval pipeline to deliver secure, conversation-scoped document Q&A. The interface and generated responses are designed for Arabic and English workflows.
 
-## What it does
+## Why this project
 
-- Authenticated accounts with JWT access and refresh tokens.
-- Independent conversations with saved message history.
-- Conversation-scoped uploads: files in one conversation are never used in another.
-- PDF, TXT, Markdown, and common image uploads.
-- PDF text extraction and optional OCR for images.
-- Retrieval-augmented generation (RAG) with SQLite storage and an optional FAISS vector index.
-- Source filename and page metadata in chat results.
-- Text and image questions through Google Gemini or OpenRouter.
-- Per-user provider configuration with encrypted stored API keys.
-- Rate limits, upload limits, health/readiness endpoints, and production checks.
+- **Grounded answers** — retrieves relevant passages before asking the model to answer, with filename and page references returned alongside the response.
+- **Strict data isolation** — every user and conversation has an independent document store; uploads never cross conversation boundaries.
+- **Multimodal input** — supports PDFs, text, Markdown, and common image formats, as well as image-based questions.
+- **Bring your own key** — users can securely save and enable their own Google Gemini or OpenRouter API key from Model Settings.
+- **Production safeguards** — Google sign-in, JWT access and refresh tokens, rate limits, encrypted provider keys, health checks, PostgreSQL, Redis, Docker, and explicit production validation.
+
+## Product flow
+
+```text
+Sign in with Google
+       ↓
+Create or select a conversation
+       ↓
+Upload documents / ask a question
+       ↓
+Extract, chunk, and retrieve relevant content
+       ↓
+Generate an answer with source metadata
+```
+
+Each account receives **one server-provided free question**. Afterwards, the application guides the user to Model Settings to add and enable their own API key.
 
 ## Architecture
 
 ```text
-Next.js frontend (port 3000)
-        |
-        | HTTP + JWT
-        v
-FastAPI backend (port 8000)
-        |
-        +-- Authentication and conversation history
-        +-- One RAGCore store per user and conversation
-        |     +-- uploads
-        |     +-- extracted text in SQLite
-        |     +-- optional FAISS index
-        |
-        +-- Google Gemini / OpenRouter: answer generation
-        +-- Gemini / OpenRouter / local Hugging Face: embeddings
+┌───────────────────────────────────────────────┐
+│ Next.js 15 + React 19 frontend                 │
+│ Google OAuth · conversations · model settings  │
+└───────────────────────┬───────────────────────┘
+                        │ HTTPS / JWT
+┌───────────────────────▼───────────────────────┐
+│ FastAPI application                            │
+│ auth · uploads · chat · provider configuration │
+└───────┬───────────────────────┬───────────────┘
+        │                       │
+┌───────▼────────┐     ┌────────▼──────────────┐
+│ PostgreSQL      │     │ Conversation RAG store │
+│ users/sessions  │     │ SQLite + optional FAISS│
+└────────────────┘     └────────┬──────────────┘
+                                 │
+                   ┌─────────────▼─────────────┐
+                   │ Gemini or OpenRouter model │
+                   └───────────────────────────┘
 ```
 
-Each conversation is stored separately under:
+Conversation data is persisted independently at:
 
 ```text
 <UPLOAD_DIR>/<user_id>/conversations/<conversation_id>/
@@ -45,104 +60,104 @@ Each conversation is stored separately under:
 └── faiss_index/                 # created when vector search is enabled
 ```
 
+## Core capabilities
+
+| Area | Details |
+| --- | --- |
+| Authentication | Google OAuth with JWT access and refresh tokens |
+| Conversations | Saved history, isolated documents, and per-conversation retrieval |
+| Files | PDF, TXT, Markdown, PNG, JPG/JPEG, TIFF, BMP, and GIF |
+| Extraction | PDF text extraction and optional Tesseract OCR for images |
+| Retrieval | SQLite-backed chunks with optional FAISS vector search |
+| Models | Google Gemini and OpenRouter; text and image prompts |
+| User model settings | Encrypted, per-user API keys with provider/model selection and enablement |
+| Operational safety | File-size cap, rate limits, ownership checks, readiness and metrics endpoints |
+
+> Uploads and image-question attachments are capped at **2 MB** by design.
+
 ## Technology
 
-| Area | Tools |
+| Layer | Stack |
 | --- | --- |
-| Frontend | Next.js 15, React 19, TypeScript, Lucide icons |
-| API | FastAPI, Uvicorn, Pydantic |
-| Authentication | JWT, PyJWT, refresh-token storage |
-| RAG | LangChain, FAISS, SQLite |
+| Web client | Next.js 15, React 19, TypeScript, Lucide |
+| API | FastAPI, Uvicorn/Gunicorn, Pydantic |
+| Persistence | PostgreSQL in production; SQLite for RAG data |
+| Caching / rate limiting | Redis |
+| Retrieval | LangChain, FAISS, sentence-transformers |
 | Document processing | pypdf, Pillow, optional Tesseract OCR |
-| Models | Google Gen AI SDK, OpenRouter API |
-| Local embeddings | sentence-transformers / Hugging Face |
-| Production services | PostgreSQL, Redis, Gunicorn, Docker Compose |
+| AI providers | Google Gen AI SDK and OpenRouter API |
+| Deployment | Docker Compose and Railway-compatible configuration |
 
-## Project structure
+## Repository layout
 
 ```text
-Multimodal-RAG-Core/
+.
 ├── backend/
-│   ├── app.py                  # FastAPI routes
-│   ├── config.py               # environment and provider settings
-│   ├── rag_core.py             # ingestion, retrieval, and generation
-│   ├── llm_provider.py         # Gemini and OpenRouter adapters
-│   ├── database.py / models.py # production authentication persistence
+│   ├── app.py                 # FastAPI routes and API orchestration
+│   ├── config.py              # environment, validation, provider settings
+│   ├── rag_core.py            # ingestion, retrieval, and answer generation
+│   ├── llm_provider.py        # Gemini and OpenRouter adapters
+│   ├── database.py            # SQLAlchemy database setup
 │   └── requirements.txt
-├── frontend/                   # Next.js application
-│   ├── app/
-│   ├── package.json
-│   └── .env.local.example
-├── tests/                      # API, RAG, security, and scale tests
-├── docker/                     # backend container image and entrypoint
-├── docker-compose.yml          # PostgreSQL, Redis, backend stack
+├── frontend/                  # Next.js application
+├── tests/                     # API, RAG, security, and scale tests
+├── docker/                    # backend image and container entrypoint
+├── docker-compose.yml         # local production-like services
 ├── docker-compose.production.yml
-├── run.py                      # starts backend and Next.js locally
-└── .env.example                # backend environment template
+├── run.py                     # local development launcher
+└── .env.example               # environment template
 ```
 
-Runtime data and secrets are excluded from version control. When `backend/.env` uses relative data paths, they resolve relative to `backend/`.
-
-## Local setup
+## Quick start
 
 ### Prerequisites
 
-- Python 3.10 or newer
-- Node.js 18.18 or newer with npm
-- A Google Gemini or OpenRouter API key for generation
-- Tesseract only if image OCR is required
+- Python 3.10+
+- Node.js 18.18+ and npm
+- A Google OAuth Web Client ID
+- A Gemini or OpenRouter API key for the server-provided free question
+- Tesseract, only when image OCR is required
 
-### 1. Create and activate a Python environment
-
-Windows PowerShell:
+### 1. Install dependencies
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
 
-### 2. Install dependencies
-
-```powershell
 pip install -r backend/requirements.txt
-pip install -r requirements-dev.txt   # optional: tests and load testing
+pip install -r requirements-dev.txt  # optional: test and load-test tooling
 
 cd frontend
 npm install
 cd ..
 ```
 
-### 3. Configure the backend
+### 2. Configure the environment
 
-Copy `.env.example` to `backend/.env` and set your keys. Do not commit this file.
-
-Minimal Gemini configuration:
+Copy `.env.example` to `backend/.env`. This file is ignored by Git and must never be committed.
 
 ```dotenv
+# backend/.env
 APP_ENV=development
-LLM_PROVIDER=google
-GOOGLE_API_KEY=your-google-api-key
+GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-web-client-id.apps.googleusercontent.com
+GOOGLE_API_KEY=your-server-gemini-api-key
 GOOGLE_MODEL=gemini-2.5-flash
+LLM_PROVIDER=google
 EMBEDDING_PROVIDER=local
 USE_VECTOR_DB=true
 ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```
 
-For OpenRouter generation:
+Create `frontend/.env.local` for browser-visible variables:
 
 ```dotenv
-LLM_PROVIDER=openrouter
-OPENROUTER_API_KEY=your-openrouter-key
-OPENROUTER_MODEL=your-openrouter-model
+NEXT_PUBLIC_API_URL=http://localhost:8000
+NEXT_PUBLIC_GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-web-client-id.apps.googleusercontent.com
 ```
 
-To point the browser application at a non-local backend, create `frontend/.env.local`:
+The Google OAuth client ID must match in both files. For OpenRouter as the server provider, set `LLM_PROVIDER=openrouter`, `OPENROUTER_API_KEY`, and `OPENROUTER_MODEL` instead.
 
-```dotenv
-NEXT_PUBLIC_API_URL=https://your-backend.example.com
-```
-
-### 4. Run the application
+### 3. Run locally
 
 From the repository root:
 
@@ -150,7 +165,7 @@ From the repository root:
 python run.py
 ```
 
-Or start each service separately:
+Or run the services separately:
 
 ```powershell
 # terminal 1
@@ -161,127 +176,95 @@ cd frontend
 npm run dev
 ```
 
-Open:
+Open the application at `http://localhost:3000`.
 
-- Frontend: `http://localhost:3000`
-- Backend health: `http://localhost:8000/health`
-- Backend readiness: `http://localhost:8000/ready`
-- API documentation: `http://localhost:8000/docs`
+| Service | URL |
+| --- | --- |
+| Frontend | `http://localhost:3000` |
+| API health | `http://localhost:8000/health` |
+| API readiness | `http://localhost:8000/ready` |
+| API documentation | `http://localhost:8000/docs` |
+| Metrics | `http://localhost:8000/metrics` |
 
-## Docker and production
+## Model providers and user API keys
 
-The Compose files run the backend with PostgreSQL and Redis. The Next.js frontend is started or deployed separately; configure its `NEXT_PUBLIC_API_URL` to the public backend URL.
+The application can use a server-configured provider for the initial free question. To continue, users open **Model Settings**, choose **Google Gemini** or **OpenRouter**, enter an API key, select a model, enable that provider, and save.
+
+Provider keys are encrypted before being stored. A user key takes precedence over the server default for that user; users can update the key or choose another supported provider later.
+
+## Deployment
+
+### Docker Compose
+
+Docker Compose runs the API with PostgreSQL and Redis. The Next.js frontend is deployed separately, or started locally, and must receive the public backend URL through `NEXT_PUBLIC_API_URL`.
 
 ```bash
 docker compose up --build
 docker compose -f docker-compose.production.yml up -d --build
 ```
 
-Production requires PostgreSQL, Redis, a strong `JWT_SECRET_KEY`, a valid `PROVIDER_ENCRYPTION_KEY`, model-provider credentials, and the actual frontend URL in `ALLOWED_ORIGINS`.
-
-## Deploy on Railway
-
-Deploy this repository as one Railway project with four services: **backend**, **frontend**, **PostgreSQL**, and **Redis**. AI inference is supplied by Gemini or OpenRouter; Railway hosts the application, not the model weights.
-
-### 1. Push to GitHub
-
-Create an empty GitHub repository, then push this project. Do not include `backend/.env`, uploaded data, databases, or API keys.
-
-```powershell
-git init
-git add .
-git commit -m "Prepare Railway deployment"
-git branch -M main
-git remote add origin https://github.com/YOUR_ACCOUNT/YOUR_REPOSITORY.git
-git push -u origin main
-```
-
-### 2. Create Railway services
-
-In Railway, create an empty project, add **PostgreSQL** and **Redis**, then add the same GitHub repository twice:
-
-| Service | Railway setting |
-| --- | --- |
-| `backend` | Root Directory: `/`; Dockerfile Path: `docker/Dockerfile`; Healthcheck Path: `/health` |
-| `frontend` | Root Directory: `/frontend`; Build Command: `npm run build`; Start Command: `npm start` |
-
-Generate a public domain for the backend first. The browser frontend calls this public URL directly.
-
-### 3. Backend variables
-
-Set these in the backend service. Add `DATABASE_URL` and `REDIS_URL` as reference variables from the Railway PostgreSQL and Redis services rather than copying credentials.
+Before production, set at least:
 
 ```dotenv
 APP_ENV=production
-DATABASE_URL=${{Postgres.DATABASE_URL}}
-REDIS_URL=${{Redis.REDIS_URL}}
-JWT_SECRET_KEY=<a unique random secret of at least 32 characters>
-PROVIDER_ENCRYPTION_KEY=<a Fernet key>
-LLM_PROVIDER=google
-GOOGLE_API_KEY=<your key>
-GOOGLE_MODEL=gemini-2.5-flash
-EMBEDDING_PROVIDER=local
-USE_VECTOR_DB=true
-UPLOAD_DIR=/app/data/uploads
-DATA_DIR=/app/data
-GUNICORN_WORKERS=1
-RAILWAY_RUN_UID=0
+DATABASE_URL=postgresql+psycopg://...
+REDIS_URL=redis://...
+JWT_SECRET_KEY=<unique secret of at least 32 characters>
+PROVIDER_ENCRYPTION_KEY=<valid Fernet key>
+ALLOWED_ORIGINS=https://your-frontend.example.com
 ```
 
-Also attach a Railway **Volume** to the backend at `/app/data`. This preserves uploads, SQLite-backed conversation/RAG data, and FAISS indexes across deployments. `RAILWAY_RUN_UID=0` is required here because the Docker image uses a non-root application user while Railway volumes are mounted as root-owned.
+The backend fails fast in production when PostgreSQL, Redis, a valid Fernet key, a strong JWT secret, or safe CORS origins are missing.
 
-### 4. Frontend variables and CORS
+### Railway
 
-Generate a public domain for the frontend, then set:
+Create four Railway services: **backend**, **frontend**, **PostgreSQL**, and **Redis**.
 
-```dotenv
-# frontend service
-NEXT_PUBLIC_API_URL=https://YOUR-BACKEND.up.railway.app
+| Service | Configuration |
+| --- | --- |
+| Backend | Root directory `/`; Dockerfile `docker/Dockerfile`; health check `/health` |
+| Frontend | Root directory `/frontend`; build `npm run build`; start `npm start` |
+| PostgreSQL / Redis | Use Railway-managed services and reference variables |
 
-# backend service
-ALLOWED_ORIGINS=https://YOUR-FRONTEND.up.railway.app
-```
+Attach a persistent backend volume at `/app/data` to retain uploaded files, SQLite RAG stores, and FAISS indexes. Set `NEXT_PUBLIC_API_URL` to the backend's public HTTPS address, and set the exact frontend HTTPS origin in `ALLOWED_ORIGINS`. Rebuild the frontend after changing `NEXT_PUBLIC_API_URL` because Next.js exposes it at build time.
 
-Redeploy the frontend after changing `NEXT_PUBLIC_API_URL`, because Next.js exposes this value to the browser during its build. Use the exact HTTPS origins without a trailing slash.
+### Current hosted deployment
 
-### 5. Verify
+[Open the deployed application](https://multimodal-rag-core-production-4615.up.railway.app/)
 
-- Open the frontend domain and register an account.
-- Visit `https://YOUR-BACKEND.up.railway.app/health`; it should return a healthy response.
-- Upload a small text or PDF file, wait for ingestion, and send a chat question.
-- Check Railway deployment logs if the backend healthcheck or the browser API request fails.
+Hosted on Railway. Availability may be temporary through October 14, 2026.
 
-Railway deployment uses GitHub as the source, so every push to the configured branch triggers a new deployment. Railway supports GitHub deployment and public domains for Next.js services, custom Dockerfile paths for backend services, and persistent volumes for files that must survive deployments. [Railway Next.js guide](https://docs.railway.com/guides/nextjs), [Dockerfile configuration](https://docs.railway.com/builds/dockerfiles), and [volumes](https://docs.railway.com/volumes).
-
-## Testing
-
-Run the automated suite from the repository root:
+## Verification and testing
 
 ```powershell
+# backend tests
 python -m pytest tests -q
-```
 
-Build-check the frontend:
-
-```powershell
+# frontend production build
 cd frontend
 npm run build
-```
 
-For load testing, start the backend then run:
-
-```powershell
+# optional load test (start the backend first)
 locust -f tests/load/locustfile.py --host http://localhost:8000
 ```
 
-## Security notes
+Recommended release checks:
 
-- Never commit `.env` files, API keys, databases, uploads, or FAISS indexes.
-- Rotate any API key that has been exposed in a terminal, screenshot, commit, or chat.
-- Configure `ALLOWED_ORIGINS` with the exact public frontend URL in production.
-- Provider keys saved from the application are encrypted before being persisted.
-- API routes verify the authenticated owner of conversations and documents.
+1. Confirm `/health` and `/ready` return successfully.
+2. Sign in through Google OAuth.
+3. Upload a small PDF or text document and ask a grounded question.
+4. Verify that returned citations match the uploaded filename and page.
+5. Confirm the public frontend origin is the only allowed browser origin.
+
+## Security and operational notes
+
+- Never commit `.env`, `.env.local`, API keys, uploads, databases, or vector indexes.
+- Rotate a key immediately if it appears in a commit, terminal capture, screenshot, or chat.
+- Use HTTPS and exact origins in `ALLOWED_ORIGINS` for every production environment.
+- Keep PostgreSQL, Redis, and the `/app/data` volume backed up according to your retention policy.
+- API routes verify that the authenticated user owns the relevant conversation and document.
+- The built-in upload limit is intentionally capped at 2 MB, even if an environment value is higher.
 
 ## License
 
-MIT License.
+Licensed under the MIT License.

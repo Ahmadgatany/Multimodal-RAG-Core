@@ -20,6 +20,7 @@ accelerate==1.2.1
 sentence-transformers==3.3.1
 Pillow==11.0.0
 google-genai==1.0.0
+google-auth==2.37.0
 
 # RAG & Vector Database
 langchain==0.3.13

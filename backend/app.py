@@ -38,6 +38,13 @@ except ImportError:  # pragma: no cover
     redis = None
 
 try:
+    from google.auth.transport import requests as google_requests
+    from google.oauth2 import id_token as google_id_token
+except ImportError:  # pragma: no cover
+    google_requests = None
+    google_id_token = None
+
+try:
     from .config import (
         AGENT_CACHE_SIZE,
         ALLOWED_ORIGINS,
@@ -48,6 +55,7 @@ try:
         CHAT_HISTORY_RETENTION_DAYS,
         DATABASE_URL,
         GOOGLE_MODEL,
+        GOOGLE_OAUTH_CLIENT_ID,
         JWT_ACCESS_TOKEN_TTL_SECONDS,
         JWT_ALGORITHM,
         JWT_REFRESH_TOKEN_TTL_SECONDS,
@@ -72,6 +80,7 @@ try:
         get_runtime_provider_config,
         reset_provider_settings,
         save_provider_settings,
+        user_has_configured_provider,
     )
 except ImportError:
     from config import (
@@ -84,6 +93,7 @@ except ImportError:
         CHAT_HISTORY_RETENTION_DAYS,
         DATABASE_URL,
         GOOGLE_MODEL,
+        GOOGLE_OAUTH_CLIENT_ID,
         JWT_ACCESS_TOKEN_TTL_SECONDS,
         JWT_ALGORITHM,
         JWT_REFRESH_TOKEN_TTL_SECONDS,
@@ -106,7 +116,9 @@ except ImportError:
         validate_runtime_configuration,
         get_provider_settings,
         get_runtime_provider_config,
+        reset_provider_settings,
         save_provider_settings,
+        user_has_configured_provider,
     )
 
 try:
@@ -555,6 +567,10 @@ class Credentials(BaseModel):
     password: str = Field(min_length=8, max_length=256)
 
 
+class GoogleCredential(BaseModel):
+    credential: str = Field(min_length=20, max_length=12000)
+
+
 class ProviderSettingsRequest(BaseModel):
     provider: str
     api_key: str = ""
@@ -573,6 +589,14 @@ def _init_auth_storage():
                 connection.exec_driver_sql("ALTER TABLE users ADD COLUMN created_at DATETIME")
             if "updated_at" not in columns:
                 connection.exec_driver_sql("ALTER TABLE users ADD COLUMN updated_at DATETIME")
+            if "google_sub" not in columns:
+                connection.exec_driver_sql("ALTER TABLE users ADD COLUMN google_sub VARCHAR(255)")
+                connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_google_sub ON users (google_sub)")
+            if "email" not in columns:
+                connection.exec_driver_sql("ALTER TABLE users ADD COLUMN email VARCHAR(254)")
+                connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users (email)")
+            if "trial_questions_used" not in columns:
+                connection.exec_driver_sql("ALTER TABLE users ADD COLUMN trial_questions_used INTEGER NOT NULL DEFAULT 0")
 
 
 def _hash_password(password: str, salt: bytes | None = None) -> str:
@@ -678,79 +702,134 @@ def startup_event():
     get_provider_settings()
 
 
-@app.post("/auth/register")
-def register(credentials: Credentials, request: Request = None):
-    _enforce_rate_limit("register", request.client.host if request and request.client else "unknown", LOGIN_RATE_LIMIT)
-    username = credentials.username.strip()
-    if len(username) < 3 or len(credentials.password) < 6:
-        raise HTTPException(400, "Username must have 3 characters and password 6 characters")
-    if SessionLocal is None or User is None:
-        raise HTTPException(503, "Authentication database is unavailable")
-    db = SessionLocal()
-    try:
-        if db.query(User).filter(User.username == username).first():
-            raise HTTPException(409, "Username already exists")
-        db.add(User(id=uuid4().hex, username=username, password_hash=_hash_password(credentials.password)))
-        db.commit()
-    finally:
-        db.close()
-    return {"message": "Account created"}
-
-
-@app.post("/auth/login")
-def login(credentials: Credentials, request: Request = None):
-    _enforce_rate_limit("login", f"{request.client.host if request and request.client else 'unknown'}:{credentials.username.strip().lower()}", LOGIN_RATE_LIMIT)
-    if User is not None and SessionLocal is not None:
-        db = SessionLocal()
-        try:
-            user = db.query(User).filter(User.username == credentials.username.strip()).first()
-            if not user or not _verify_password(credentials.password, user.password_hash):
-                raise HTTPException(401, "Invalid username or password")
-            if not user.password_hash.startswith("scrypt$"):
-                user.password_hash = _hash_password(credentials.password)
-                db.commit()
-        finally:
-            db.close()
-
-        _prune_sessions()
-        if len(sessions) >= MAX_ACTIVE_USERS:
-            raise HTTPException(429, f"Maximum active users reached ({MAX_ACTIVE_USERS}). Please retry in a moment.")
-        access_token = create_access_token(user.id)
-        refresh_token = create_refresh_token(user.id)
-        _store_session_token(access_token, user.id)
-        _store_refresh_token_record(user.id, refresh_token)
-        _prune_chat_history()
-        return {
-            "token": access_token,
-            "refresh_token": refresh_token,
-            "username": user.username,
-            "expires_in": JWT_ACCESS_TOKEN_TTL_SECONDS,
-            "refresh_expires_in": JWT_REFRESH_TOKEN_TTL_SECONDS,
-        }
-
-    with sqlite3.connect(AUTH_DB_PATH) as connection:
-        user = connection.execute(
-            "SELECT id, password_hash FROM users WHERE username = ?", (credentials.username.strip(),)
-        ).fetchone()
-    if not user or not _verify_password(credentials.password, user[1]):
-        raise HTTPException(401, "Invalid username or password")
-
+def _issue_session(user: User) -> dict[str, Any]:
     _prune_sessions()
     if len(sessions) >= MAX_ACTIVE_USERS:
         raise HTTPException(429, f"Maximum active users reached ({MAX_ACTIVE_USERS}). Please retry in a moment.")
-
-    token = create_access_token(user[0])
-    refresh_token = create_refresh_token(user[0])
-    _store_session_token(token, user[0])
-    _store_refresh_token_record(user[0], refresh_token)
+    token = create_access_token(user.id)
+    refresh_token = create_refresh_token(user.id)
+    _store_session_token(token, user.id)
+    _store_refresh_token_record(user.id, refresh_token)
     _prune_chat_history()
     return {
         "token": token,
         "refresh_token": refresh_token,
-        "username": credentials.username.strip(),
+        "username": user.email or user.username,
         "expires_in": JWT_ACCESS_TOKEN_TTL_SECONDS,
         "refresh_expires_in": JWT_REFRESH_TOKEN_TTL_SECONDS,
     }
+
+
+@app.post("/auth/google")
+def google_login(payload: GoogleCredential, request: Request = None):
+    """Create or resume an account solely from a server-verified Google ID token."""
+    _enforce_rate_limit("google_login", request.client.host if request and request.client else "unknown", LOGIN_RATE_LIMIT)
+    if not GOOGLE_OAUTH_CLIENT_ID:
+        raise HTTPException(503, "Google login is not configured. Set GOOGLE_OAUTH_CLIENT_ID.")
+    if google_id_token is None or google_requests is None:
+        raise HTTPException(503, "Google authentication dependency is unavailable")
+    try:
+        identity = google_id_token.verify_oauth2_token(
+            payload.credential, google_requests.Request(), GOOGLE_OAUTH_CLIENT_ID
+        )
+    except Exception as error:
+        raise HTTPException(401, "Google sign-in could not be verified") from error
+    google_sub = str(identity.get("sub") or "")
+    email = str(identity.get("email") or "").strip().lower()
+    if not google_sub or not email or identity.get("email_verified") is not True:
+        raise HTTPException(401, "A verified Google email address is required")
+    if SessionLocal is None or User is None:
+        raise HTTPException(503, "Authentication database is unavailable")
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.google_sub == google_sub).first()
+        if user is None:
+            # A legacy account can only be linked when Google has verified the
+            # exact email; otherwise account creation is based solely on sub.
+            user = db.query(User).filter(User.email == email).first()
+            if user is not None and user.google_sub not in (None, google_sub):
+                raise HTTPException(409, "This Google email is linked to a different account")
+            if user is None:
+                user = User(
+                    id=uuid4().hex,
+                    username=f"google_{google_sub[:64]}",
+                    password_hash="google-oauth-only",
+                    google_sub=google_sub,
+                    email=email,
+                )
+                db.add(user)
+            else:
+                user.google_sub = google_sub
+            db.commit()
+            db.refresh(user)
+        elif user.email != email:
+            user.email = email
+            db.commit()
+        db.expunge(user)
+    finally:
+        db.close()
+    return _issue_session(user)
+
+
+def _require_model_access(user_id: str) -> User:
+    """Return the user when they can use a model without consuming a trial."""
+    user = _require_user(user_id)
+    if user.trial_questions_used >= 1 and not user_has_configured_provider(user_id):
+        raise HTTPException(
+            402,
+            "Your free question has been used. To continue chatting, add and enable your own API key in Model Settings.",
+        )
+    return user
+
+
+def _claim_trial_question(user_id: str) -> bool:
+    """Atomically reserve the one free question, or return False for BYO keys."""
+    if user_has_configured_provider(user_id):
+        return False
+    db = _safe_db_session()
+    if db is None:
+        raise HTTPException(503, "Authentication database is unavailable")
+    try:
+        claimed = (
+            db.query(User)
+            .filter(User.id == user_id, User.trial_questions_used < 1)
+            .update({User.trial_questions_used: User.trial_questions_used + 1}, synchronize_session=False)
+        )
+        db.commit()
+        if not claimed:
+            raise HTTPException(
+                402,
+                "Your free question has been used. To continue chatting, add and enable your own API key in Model Settings.",
+            )
+        return True
+    finally:
+        db.close()
+
+
+def _release_trial_question(user_id: str) -> None:
+    """Return a reserved trial question when the provider fails to answer."""
+    db = _safe_db_session()
+    if db is None:
+        return
+    try:
+        db.query(User).filter(User.id == user_id, User.trial_questions_used == 1).update(
+            {User.trial_questions_used: 0}, synchronize_session=False
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _provider_error_message(error: Exception) -> str:
+    """Expose actionable provider failures without leaking the submitted key."""
+    message = str(error).lower()
+    if any(term in message for term in ("quota", "resource_exhausted", "insufficient_quota", "credit", "billing", "payment required", "balance")):
+        return "Your API provider quota or credits are exhausted. Add credits or use a different API key in Model Settings."
+    if any(term in message for term in ("invalid api key", "api key not valid", "invalid_api_key", "unauthorized", "authentication")):
+        return "The API key was rejected. Check the key and selected provider in Model Settings."
+    if "rate limit" in message or "too many requests" in message:
+        return "Your API provider rate limit was reached. Please wait and try again."
+    return "The model provider could not complete the request. Verify your API key, model name, and provider account."
 
 
 @app.post("/auth/refresh")
@@ -790,7 +869,12 @@ def refresh_token(payload: dict[str, str]):
 @app.get("/settings/providers")
 def get_provider_settings_route(authorization: Optional[str] = Header(None)):
     user_id = _current_user(authorization)
-    return {"providers": get_provider_settings(user_id), "supported": SUPPORTED_PROVIDERS, "active": LLM_PROVIDER}
+    user = _require_user(user_id)
+    return {
+        "providers": get_provider_settings(user_id), "supported": SUPPORTED_PROVIDERS, "active": LLM_PROVIDER,
+        "free_questions_remaining": max(0, 1 - user.trial_questions_used),
+        "has_own_api_key": user_has_configured_provider(user_id),
+    }
 
 
 @app.post("/settings/providers")
@@ -840,8 +924,10 @@ def get_profile(authorization: Optional[str] = Header(None)):
 
     return {
         "user_id": user_id,
-        "username": user.username,
+        "username": user.email or user.username,
         "supported_providers": SUPPORTED_PROVIDERS,
+        "free_questions_remaining": max(0, 1 - user.trial_questions_used),
+        "has_own_api_key": user_has_configured_provider(user_id),
     }
 
 
@@ -924,6 +1010,22 @@ def _ingest_file(user_id: str, conversation_id: str, document_id: str, path: str
     agent = _get_agent(user_id, conversation_id)
     job = agent.get_job(document_id)
     agent.ingest_file(document_id, path, display_name=job.get("filename") if job else None)
+
+
+async def _read_upload_with_limit(file: UploadFile) -> bytes:
+    """Read an upload without accepting more than the hard 2 MB application cap."""
+    maximum = MAX_UPLOAD_MB * 1024 * 1024
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(min(64 * 1024, maximum + 1))
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > maximum:
+            raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_MB} MB limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @app.get("/health")
@@ -1035,9 +1137,7 @@ async def upload_file(background_tasks: BackgroundTasks, conversation_id: Option
 
     out_path = agent.upload_dir / f"{uuid4().hex}{suffix}"
     try:
-        content = await file.read()
-        if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
-            raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_MB} MB limit")
+        content = await _read_upload_with_limit(file)
         if not content:
             raise HTTPException(400, "Uploaded file is empty")
         if suffix == ".pdf" and not content.startswith(b"%PDF-"):
@@ -1064,16 +1164,21 @@ def chat(request: QueryRequest, authorization: Optional[str] = Header(None)):
     if not _conversation_exists(user_id, request.conversation_id):
         raise HTTPException(404, "Conversation not found")
     _enforce_rate_limit("chat", user_id, CHAT_RATE_LIMIT)
+    _require_model_access(user_id)
+    trial_claimed = _claim_trial_question(user_id)
     agent = _get_agent(user_id, request.conversation_id)
 
     try:
         with _metrics_lock:
             _metrics["llm_requests"] += 1
             _metrics["llm_by_provider"][LLM_PROVIDER] += 1
-        return agent.answer_with_sources(request.question, k=request.k)
+        result = agent.answer_with_sources(request.question, k=request.k)
+        return result
     except Exception as error:
+        if trial_claimed:
+            _release_trial_question(user_id)
         logger.exception(json.dumps({"event": "chat_model_failed", "user_id": user_id, "error_type": type(error).__name__}))
-        raise HTTPException(502, f"The model request failed: {str(error)[:300]}") from error
+        raise HTTPException(502, _provider_error_message(error)) from error
 
 
 @app.post("/chat_with_image")
@@ -1088,6 +1193,7 @@ async def chat_with_image(
     if not _conversation_exists(user_id, conversation_id):
         raise HTTPException(404, "Conversation not found")
     _enforce_rate_limit("chat_image", user_id, CHAT_RATE_LIMIT)
+    _require_model_access(user_id)
     if not question.strip() or len(question) > 4000:
         raise HTTPException(422, "question must be between 1 and 4000 characters")
     agent = _get_agent(user_id, conversation_id)
@@ -1095,20 +1201,26 @@ async def chat_with_image(
     img_data = None
     if image is not None:
         try:
-            img_stream = BytesIO(await image.read())
+            img_stream = BytesIO(await _read_upload_with_limit(image))
             img_data = Image.open(img_stream)
+        except HTTPException:
+            raise
         except Exception as error:
             raise HTTPException(415, "Failed to process image") from error
 
+    trial_claimed = _claim_trial_question(user_id)
     try:
         runtime_config = get_runtime_provider_config(user_id)
         with _metrics_lock:
             _metrics["llm_requests"] += 1
             _metrics["llm_by_provider"][runtime_config["provider"]] += 1
-        return agent.answer_with_sources(question, image=img_data, k=k or 5)
+        result = agent.answer_with_sources(question, image=img_data, k=k or 5)
+        return result
     except Exception as error:
+        if trial_claimed:
+            _release_trial_question(user_id)
         logger.exception(json.dumps({"event": "image_chat_model_failed", "user_id": user_id, "provider": runtime_config.get("provider", "unknown") if "runtime_config" in locals() else "unknown", "model": runtime_config.get("model", "unknown") if "runtime_config" in locals() else "unknown", "error_type": type(error).__name__, "error": str(error)[:500]}))
-        raise HTTPException(502, f"The model request failed: {type(error).__name__}") from error
+        raise HTTPException(502, _provider_error_message(error)) from error
 
 @app.post("/summarize")
 def summarize(conversation_id: str = Query(...), authorization: Optional[str] = Header(None)):

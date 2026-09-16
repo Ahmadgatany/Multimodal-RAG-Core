@@ -11,6 +11,7 @@ env/
 node_modules/
 .next/
 .env
+.env.local
 backend/.env
 backend/data/
 data/

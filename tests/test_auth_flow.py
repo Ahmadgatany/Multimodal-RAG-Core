@@ -46,17 +46,23 @@ def test_refresh_rotation_revokes_previous_refresh_token():
     assert backend_app.decode_refresh_token(new_refresh)["sub"] == "user-rotation"
 
 
-def test_register_and_login_work_with_same_auth_database():
+def test_google_login_creates_and_reuses_verified_account(monkeypatch):
     backend_app.sessions.clear()
     backend_app._init_auth_storage()
+    google_sub = f"test-google-sub-{backend_app.uuid4().hex}"
 
-    username = f"db_regression_user_{backend_app.uuid4().hex[:8]}"
-    password = "db_regression_pass"
+    class FakeGoogleToken:
+        @staticmethod
+        def verify_oauth2_token(*_args, **_kwargs):
+            return {"sub": google_sub, "email": f"{google_sub}@example.com", "email_verified": True}
 
-    register_response = backend_app.register(backend_app.Credentials(username=username, password=password))
-    login_response = backend_app.login(backend_app.Credentials(username=username, password=password))
+    monkeypatch.setattr(backend_app, "GOOGLE_OAUTH_CLIENT_ID", "test-client-id")
+    monkeypatch.setattr(backend_app, "google_id_token", FakeGoogleToken)
+    monkeypatch.setattr(backend_app, "google_requests", type("Requests", (), {"Request": staticmethod(lambda: object())}))
 
-    assert register_response["message"] == "Account created"
-    assert login_response["username"] == username
-    assert login_response["token"]
-    assert login_response["refresh_token"]
+    first = backend_app.google_login(backend_app.GoogleCredential(credential="x" * 30))
+    second = backend_app.google_login(backend_app.GoogleCredential(credential="x" * 30))
+
+    assert first["username"] == f"{google_sub}@example.com"
+    assert first["token"]
+    assert second["token"]

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import Script from "next/script";
 import {
   Bot,
   FileText,
@@ -21,6 +22,12 @@ import {
 } from "lucide-react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_OAUTH_CLIENT_ID || "";
+declare global {
+  interface Window {
+    google?: { accounts: { id: { initialize: (options: { client_id: string; callback: (response: { credential: string }) => void }) => void; renderButton: (element: HTMLElement, options: Record<string, string | number>) => void } } };
+  }
+}
 type Conversation = { id: string; title?: string; updated_at?: number };
 type Message = { role: "user" | "assistant"; content: string };
 type Document = {
@@ -126,9 +133,6 @@ async function request(path: string, options: RequestInit = {}) {
 export default function Home() {
   const [token, setToken] = useState<string | null>(null);
   const [username, setUsername] = useState("");
-  const [loginMode, setLoginMode] = useState(true);
-  const [authUsername, setAuthUsername] = useState("");
-  const [password, setPassword] = useState("");
   const [authError, setAuthError] = useState("");
   const [loading, setLoading] = useState(false);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -150,7 +154,10 @@ export default function Home() {
   const [settingsMessage, setSettingsMessage] = useState("");
   const [settingsError, setSettingsError] = useState("");
   const [savingSettings, setSavingSettings] = useState(false);
+  const [googleScriptLoaded, setGoogleScriptLoaded] = useState(false);
+  const [freeQuestionsRemaining, setFreeQuestionsRemaining] = useState<number | null>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
+  const googleButtonRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const saved = localStorage.getItem("rag_token");
@@ -171,6 +178,12 @@ export default function Home() {
     if (token) loadProviderSettings();
   }, [token]);
   useEffect(() => {
+    if (!googleScriptLoaded || token || !googleButtonRef.current || !window.google || !GOOGLE_CLIENT_ID) return;
+    window.google.accounts.id.initialize({ client_id: GOOGLE_CLIENT_ID, callback: handleGoogleCredential });
+    googleButtonRef.current.replaceChildren();
+    window.google.accounts.id.renderButton(googleButtonRef.current, { theme: "outline", size: "large", text: "continue_with", width: 320 });
+  }, [googleScriptLoaded, token]);
+  useEffect(() => {
     messagesRef.current?.scrollTo({
       top: messagesRef.current.scrollHeight,
       behavior: "smooth",
@@ -189,6 +202,7 @@ export default function Home() {
     try {
       const data = await request("/settings/providers");
       const settings = data.providers || {};
+      setFreeQuestionsRemaining(data.free_questions_remaining ?? null);
       setProviderSettings(settings);
       const firstProvider = Object.keys(settings)[0] || "google";
       setSelectedProvider((current) =>
@@ -248,26 +262,11 @@ export default function Home() {
       setSavingSettings(false);
     }
   }
-  async function resetProviderSettings() {
-    setSavingSettings(true);
-    setSettingsMessage("");
-    setSettingsError("");
-    try {
-      const resetData = await request("/settings/providers/reset", { method: "POST" });
-      await loadProviderSettings();
-      setSelectedProvider("google");
-      setProviderApiKey("");
-      setProviderModel(resetData.model || "");
-      setProviderEnabled(true);
-      setSettingsMessage("تم الرجوع إلى Google والإعدادات الافتراضية");
-    } catch (error) {
-      setSettingsError(
-        error instanceof Error ? error.message : "تعذر استرجاع الإعدادات الافتراضية",
-      );
-    } finally {
-      setSavingSettings(false);
-    }
+  function openModelSettings() {
+    setSettingsOpen(true);
+    selectProvider(selectedProvider);
   }
+
   async function selectConversation(id: string) {
     setConversationId(id);
     try {
@@ -283,21 +282,14 @@ export default function Home() {
       );
     }
   }
-  async function authenticate(event: React.FormEvent) {
-    event.preventDefault();
+  async function handleGoogleCredential(response: { credential: string }) {
     setLoading(true);
     setAuthError("");
     try {
-      if (!loginMode)
-        await request("/auth/register", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username: authUsername, password }),
-        });
-      const data = await request("/auth/login", {
+      const data = await request("/auth/google", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username: authUsername, password }),
+        body: JSON.stringify({ credential: response.credential }),
       });
       localStorage.setItem("rag_token", data.token);
       localStorage.setItem("rag_refresh_token", data.refresh_token);
@@ -305,9 +297,7 @@ export default function Home() {
       setToken(data.token);
       setUsername(data.username);
     } catch (error) {
-      setAuthError(
-        error instanceof Error ? error.message : "تعذر تسجيل الدخول",
-      );
+      setAuthError(error instanceof Error ? error.message : "Google sign-in failed. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -379,7 +369,7 @@ export default function Home() {
           conversation_id: id,
         }),
       });
-      await loadConversations();
+      await Promise.all([loadConversations(), loadProviderSettings()]);
     } catch (error) {
       setMessages((current) => [
         ...current,
@@ -395,6 +385,11 @@ export default function Home() {
   async function uploadFile(event: React.ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
+    if (file.size > 2 * 1024 * 1024) {
+      setAuthError("File size must not exceed 2 MB.");
+      event.target.value = "";
+      return;
+    }
     const form = new FormData();
     if (conversationId) form.append("conversation_id", conversationId);
     form.append("file", file);
@@ -437,7 +432,8 @@ export default function Home() {
   if (!token)
     return (
       <main className="auth">
-        <form className="auth-card" onSubmit={authenticate}>
+        <Script src="https://accounts.google.com/gsi/client" strategy="afterInteractive" onLoad={() => setGoogleScriptLoaded(true)} />
+        <section className="auth-card">
           <div className="brand">
             <div className="brand-mark">N</div>
             <div>
@@ -445,50 +441,13 @@ export default function Home() {
               <small>KNOWLEDGE STUDIO</small>
             </div>
           </div>
-          <h1>{loginMode ? "مرحبًا بعودتك" : "أنشئ مساحتك"}</h1>
-          <p>حوّل مستنداتك إلى إجابات واضحة يمكن الوثوق بها.</p>
+          <h1>تسجيل الدخول</h1>
+          <p>سجّل الدخول بحساب Google المُتحقق للوصول إلى مساحتك.</p>
           {authError && <div className="error">{authError}</div>}
-          <div className="field">
-            <label>اسم المستخدم</label>
-            <input
-              required
-              minLength={3}
-              value={authUsername}
-              onChange={(e) => setAuthUsername(e.target.value)}
-              placeholder="مثال: ahmed"
-            />
-          </div>
-          <div className="field">
-            <label>كلمة المرور</label>
-            <input
-              required
-              minLength={8}
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="8 أحرف على الأقل"
-            />
-          </div>
-          <button className="primary" disabled={loading}>
-            {loading
-              ? "جارٍ المعالجة..."
-              : loginMode
-                ? "دخول إلى المساحة"
-                : "إنشاء الحساب"}
-          </button>
-          <button
-            type="button"
-            className="switch"
-            onClick={() => {
-              setLoginMode(!loginMode);
-              setAuthError("");
-            }}
-          >
-            {loginMode
-              ? "ليس لديك حساب؟ أنشئ حسابًا"
-              : "لديك حساب؟ سجّل الدخول"}
-          </button>
-        </form>
+          {!GOOGLE_CLIENT_ID && <div className="error">Google sign-in has not been configured yet.</div>}
+          <div ref={googleButtonRef} />
+          {loading && <p>Signing you in…</p>}
+        </section>
       </main>
     );
 
@@ -553,10 +512,7 @@ export default function Home() {
           <div className="topbar-actions">
             <button
               className="settings-trigger"
-              onClick={() => {
-                setSettingsOpen(true);
-                selectProvider(selectedProvider);
-              }}
+                onClick={openModelSettings}
             >
               <Settings size={16} /> إعدادات النموذج
             </button>
@@ -600,7 +556,6 @@ export default function Home() {
                 </div>
                 <label className="toggle-row"><input type="checkbox" checked={providerEnabled} onChange={(event) => setProviderEnabled(event.target.checked)} /> <span>استخدام هذا المزود</span></label>
                 <button className="primary settings-save" disabled={savingSettings}><Save size={16} /> {savingSettings ? "جارٍ الحفظ..." : "حفظ الإعدادات"}</button>
-                <button type="button" className="settings-reset" onClick={resetProviderSettings} disabled={savingSettings}>الرجوع للإعدادات الافتراضية</button>
               </form>
             </section>
           </div>
@@ -620,6 +575,18 @@ export default function Home() {
           </div>
           {authError && <div className="error">{authError}</div>}
           <div className="workspace">
+            {freeQuestionsRemaining !== null && (
+              <div className={freeQuestionsRemaining > 0 ? "success" : "trial-limit"}>
+                {freeQuestionsRemaining > 0 ? (
+                  <>You have 1 free question remaining. You can use it now without an API key; after that, add and enable your own API key to continue.</>
+                ) : (
+                  <>
+                    Your free question has been used. To continue chatting, add and enable your own API key.
+                    <button type="button" className="settings-link" onClick={openModelSettings}>Open Model Settings</button>
+                  </>
+                )}
+              </div>
+            )}
             <section className="chat-panel">
               <div className="messages" ref={messagesRef}>
                 {messages.length === 0 ? (
@@ -691,6 +658,7 @@ export default function Home() {
             <aside className="documents">
               <h3>مصادر المعرفة</h3>
               <p>ارفع ملفاتك ليستخدمها NOVA كمرجع في الإجابات.</p>
+              <p>الحد الأقصى لحجم كل ملف: 2 MB.</p>
               <label className="upload">
                 <Upload size={16} /> {uploading ? "جارٍ الرفع..." : "رفع مستند"}
                 <input
