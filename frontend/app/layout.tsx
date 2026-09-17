@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "NOVA | Multimodal RAG",
+  title: "RAGX | Multimodal RAG",
   description: "واجهة ذكية للبحث والتحدث مع مستنداتك",
 };
 

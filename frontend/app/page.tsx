@@ -437,7 +437,7 @@ export default function Home() {
           <div className="brand">
             <div className="brand-mark">N</div>
             <div>
-              <strong>NOVA</strong>
+              <strong>RAGX</strong>
               <small>KNOWLEDGE STUDIO</small>
             </div>
           </div>
@@ -457,7 +457,7 @@ export default function Home() {
         <div className="brand">
           <div className="brand-mark">N</div>
           <div>
-            <strong>NOVA</strong>
+            <strong>RAGX</strong>
             <small>KNOWLEDGE STUDIO</small>
           </div>
         </div>
@@ -569,7 +569,7 @@ export default function Home() {
                 <br />
                 اكتشف بوضوح.
               </h2>
-              <p>ابدأ محادثة مع مستنداتك، ودع NOVA يجد المعنى خلف كل صفحة.</p>
+              <p>ابدأ محادثة مع مستنداتك، ودع RAGX يجد المعنى خلف كل صفحة.</p>
             </div>
             <Sparkles className="leaf" />
           </div>
@@ -657,7 +657,7 @@ export default function Home() {
             </section>
             <aside className="documents">
               <h3>مصادر المعرفة</h3>
-              <p>ارفع ملفاتك ليستخدمها NOVA كمرجع في الإجابات.</p>
+              <p>ارفع ملفاتك ليستخدمها RAGX كمرجع في الإجابات.</p>
               <p>الحد الأقصى لحجم كل ملف: 2 MB.</p>
               <label className="upload">
                 <Upload size={16} /> {uploading ? "جارٍ الرفع..." : "رفع مستند"}
