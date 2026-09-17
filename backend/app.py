@@ -1257,9 +1257,12 @@ def chat(request: QueryRequest, authorization: Optional[str] = Header(None)):
         result = agent.answer_with_sources(request.question, k=request.k)
         return result
     except Exception as error:
+        fallback = agent.suggested_questions(request.question)
+        logger.exception(json.dumps({"event": "chat_model_failed", "user_id": user_id, "error_type": type(error).__name__, "error": str(error)[:500], "fallback_served": bool(fallback)}))
+        if fallback:
+            return fallback
         if trial_claimed:
             _release_trial_question(user_id)
-        logger.exception(json.dumps({"event": "chat_model_failed", "user_id": user_id, "error_type": type(error).__name__}))
         raise HTTPException(502, _provider_error_message(error)) from error
 
 

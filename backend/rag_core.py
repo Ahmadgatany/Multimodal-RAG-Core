@@ -299,6 +299,42 @@ class RAGCore:
         prompt = messages if isinstance(messages, str) else "\n\n".join(f"{item['role'].upper()}: {item['content']}" for item in messages)
         return self._provider().generate(prompt, image=image, max_output_tokens=max_new_tokens)
 
+    @staticmethod
+    def is_question_request(question: str) -> bool:
+        """Return whether a user is asking for suggested/review questions."""
+        normalized = question.lower()
+        markers = ("سؤال", "اسئل", "أسئل", "اختبار", "امتحان", "question", "quiz", "test")
+        return any(marker in normalized for marker in markers)
+
+    def suggested_questions(self, question: str, count: int = 3) -> Optional[dict[str, Any]]:
+        """Provide a useful offline fallback when question generation cannot reach an LLM."""
+        records = self._records()
+        if not records or not self.is_question_request(question):
+            return None
+
+        source_names = list(dict.fromkeys(Path(record["source"]).name for record in records))
+        source_label = source_names[0] if len(source_names) == 1 else "المستندات المرفوعة"
+        is_arabic = bool(re.search(r"[\u0600-\u06ff]", question))
+        questions = (
+            [
+                f"ما الفكرة أو الموضوع الرئيسي الذي يتناوله مستند «{source_label}»؟",
+                "ما أهم المعلومات أو المهارات أو النقاط التي وردت في المحتوى؟",
+                "ما مثال عملي أو نتيجة يمكن استخلاصها من المعلومات الواردة؟",
+            ]
+            if is_arabic
+            else [
+                f"What is the main topic covered in \"{source_label}\"?",
+                "What are the most important facts, skills, or ideas mentioned in the content?",
+                "What practical example or conclusion can be drawn from the information provided?",
+            ]
+        )[:max(1, min(count, 3))]
+        sources = [
+            {"document_id": record.get("document_id"), "filename": Path(record["source"]).name, "page_number": record.get("page_number")}
+            for record in records[:1]
+        ]
+        heading = "هذه 3 أسئلة مقترحة عن المحتوى:" if is_arabic else "Here are 3 suggested questions about the content:"
+        return {"answer": heading + "\n\n" + "\n".join(f"{index}. {item}" for index, item in enumerate(questions, start=1)), "sources": sources, "fallback": True}
+
     def answer_with_sources(self, question: str, image: Optional[Image.Image] = None, k: int = 5) -> dict[str, Any]:
         image = image or self._latest_image()
         format_instruction = ""

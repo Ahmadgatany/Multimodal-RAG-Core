@@ -37,3 +37,21 @@ def test_follow_up_question_reuses_uploaded_image(tmp_path):
 
     assert result["answer"] == "invoice answer"
     assert captured["image"] is not None
+
+
+def test_question_request_has_offline_fallback_for_uploaded_content(tmp_path):
+    text_file = tmp_path / "profile.txt"
+    text_file.write_text("Ahmed is a Flutter developer with mobile application experience.", encoding="utf-8")
+
+    agent = RAGCore(upload_dir=str(tmp_path / "uploads"), db_path=str(tmp_path / "rag.sqlite3"))
+    agent.use_vector_db = False
+    document_id = agent.create_ingestion_job(text_file.name)
+    agent.ingest_file(document_id, str(text_file))
+
+    result = agent.suggested_questions("ممكن تستخرج لي 3 اسئلة عن المحتوى؟")
+
+    assert result is not None
+    assert result["fallback"] is True
+    assert result["answer"].count("\n") >= 4
+    assert "profile.txt" in result["answer"]
+    assert agent.suggested_questions("لخص المحتوى") is None
