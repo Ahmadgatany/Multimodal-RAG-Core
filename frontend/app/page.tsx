@@ -156,6 +156,7 @@ export default function Home() {
   const [savingSettings, setSavingSettings] = useState(false);
   const [googleScriptLoaded, setGoogleScriptLoaded] = useState(false);
   const [freeQuestionsRemaining, setFreeQuestionsRemaining] = useState<number | null>(null);
+  const [hasOwnApiKey, setHasOwnApiKey] = useState(false);
   const messagesRef = useRef<HTMLDivElement>(null);
   const googleButtonRef = useRef<HTMLDivElement>(null);
 
@@ -203,6 +204,7 @@ export default function Home() {
       const data = await request("/settings/providers");
       const settings = data.providers || {};
       setFreeQuestionsRemaining(data.free_questions_remaining ?? null);
+      setHasOwnApiKey(Boolean(data.has_own_api_key));
       setProviderSettings(settings);
       const firstProvider = Object.keys(settings)[0] || "google";
       setSelectedProvider((current) =>
@@ -252,6 +254,7 @@ export default function Home() {
           configured: data.configured,
         },
       }));
+      setHasOwnApiKey(Boolean(data.has_own_api_key ?? data.configured));
       setProviderApiKey("");
       setSettingsMessage("تم حفظ إعدادات المزود بنجاح");
     } catch (error) {
@@ -575,7 +578,7 @@ export default function Home() {
           </div>
           {authError && <div className="error">{authError}</div>}
           <div className="workspace">
-            {freeQuestionsRemaining !== null && (
+            {freeQuestionsRemaining !== null && !hasOwnApiKey && (
               <div className={freeQuestionsRemaining > 0 ? "success" : "trial-limit"}>
                 {freeQuestionsRemaining > 0 ? (
                   <>You have {freeQuestionsRemaining} free questions remaining. You can use them without an API key; after that, add and enable your own API key to continue.</>

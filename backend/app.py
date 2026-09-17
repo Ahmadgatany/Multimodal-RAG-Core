@@ -944,7 +944,12 @@ def save_provider_settings_route(payload: ProviderSettingsRequest, authorization
     if not payload.model_name.strip():
         raise HTTPException(400, "model_name is required")
     save_provider_settings(user_id, provider_name, payload.api_key.strip(), payload.model_name.strip(), payload.enabled)
-    return {"provider": provider_name, "saved": True, "configured": get_provider_settings(user_id)[provider_name]["configured"]}
+    return {
+        "provider": provider_name,
+        "saved": True,
+        "configured": get_provider_settings(user_id)[provider_name]["configured"],
+        "has_own_api_key": user_has_configured_provider(user_id),
+    }
 
 
 @app.post("/settings/providers/reset")
