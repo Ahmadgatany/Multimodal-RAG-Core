@@ -435,7 +435,7 @@ export default function Home() {
         <Script src="https://accounts.google.com/gsi/client" strategy="afterInteractive" onLoad={() => setGoogleScriptLoaded(true)} />
         <section className="auth-card">
           <div className="brand">
-            <div className="brand-mark">N</div>
+            <div className="brand-mark">R</div>
             <div>
               <strong>RAGX</strong>
               <small>KNOWLEDGE STUDIO</small>
@@ -455,7 +455,7 @@ export default function Home() {
     <main className="shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">N</div>
+          <div className="brand-mark">R</div>
           <div>
             <strong>RAGX</strong>
             <small>KNOWLEDGE STUDIO</small>
