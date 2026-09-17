@@ -8,7 +8,7 @@ from starlette.datastructures import UploadFile
 from backend import app as backend_app
 
 
-def test_free_question_can_only_be_claimed_once_without_a_personal_key():
+def test_free_questions_can_be_claimed_three_times_without_a_personal_key():
     backend_app._init_auth_storage()
     user_id = backend_app.uuid4().hex
     db = backend_app.SessionLocal()
@@ -23,6 +23,8 @@ def test_free_question_can_only_be_claimed_once_without_a_personal_key():
         db.add(user)
         db.commit()
 
+        assert backend_app._claim_trial_question(user_id) is True
+        assert backend_app._claim_trial_question(user_id) is True
         assert backend_app._claim_trial_question(user_id) is True
         with pytest.raises(HTTPException) as error:
             backend_app._claim_trial_question(user_id)

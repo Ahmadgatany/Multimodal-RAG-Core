@@ -74,6 +74,7 @@ try:
         RATE_LIMIT_WINDOW_SECONDS,
         SESSION_TTL_SECONDS,
         SUPPORTED_PROVIDERS,
+        TRIAL_QUESTIONS_LIMIT,
         UPLOAD_DIR,
         USE_VECTOR_DB,
         validate_runtime_configuration,
@@ -113,6 +114,7 @@ except ImportError:
         RATE_LIMIT_WINDOW_SECONDS,
         SESSION_TTL_SECONDS,
         SUPPORTED_PROVIDERS,
+        TRIAL_QUESTIONS_LIMIT,
         UPLOAD_DIR,
         USE_VECTOR_DB,
         validate_runtime_configuration,
@@ -826,16 +828,16 @@ def google_login(payload: GoogleCredential, request: Request = None):
 def _require_model_access(user_id: str) -> User:
     """Return the user when they can use a model without consuming a trial."""
     user = _require_user(user_id)
-    if user.trial_questions_used >= 1 and not user_has_configured_provider(user_id):
+    if user.trial_questions_used >= TRIAL_QUESTIONS_LIMIT and not user_has_configured_provider(user_id):
         raise HTTPException(
             402,
-            "Your free question has been used. To continue chatting, add and enable your own API key in Model Settings.",
+            "Your free questions have been used. To continue chatting, add and enable your own API key in Model Settings.",
         )
     return user
 
 
 def _claim_trial_question(user_id: str) -> bool:
-    """Atomically reserve the one free question, or return False for BYO keys."""
+    """Atomically reserve one free question, or return False for BYO keys."""
     if user_has_configured_provider(user_id):
         return False
     db = _safe_db_session()
@@ -844,14 +846,14 @@ def _claim_trial_question(user_id: str) -> bool:
     try:
         claimed = (
             db.query(User)
-            .filter(User.id == user_id, User.trial_questions_used < 1)
+            .filter(User.id == user_id, User.trial_questions_used < TRIAL_QUESTIONS_LIMIT)
             .update({User.trial_questions_used: User.trial_questions_used + 1}, synchronize_session=False)
         )
         db.commit()
         if not claimed:
             raise HTTPException(
                 402,
-                "Your free question has been used. To continue chatting, add and enable your own API key in Model Settings.",
+                "Your free questions have been used. To continue chatting, add and enable your own API key in Model Settings.",
             )
         return True
     finally:
@@ -864,7 +866,7 @@ def _release_trial_question(user_id: str) -> None:
     if db is None:
         return
     try:
-        db.query(User).filter(User.id == user_id, User.trial_questions_used == 1).update(
+        db.query(User).filter(User.id == user_id, User.trial_questions_used > 0).update(
             {User.trial_questions_used: 0}, synchronize_session=False
         )
         db.commit()
@@ -924,7 +926,7 @@ def get_provider_settings_route(authorization: Optional[str] = Header(None)):
     user = _require_user(user_id)
     return {
         "providers": get_provider_settings(user_id), "supported": SUPPORTED_PROVIDERS, "active": LLM_PROVIDER,
-        "free_questions_remaining": max(0, 1 - user.trial_questions_used),
+        "free_questions_remaining": max(0, TRIAL_QUESTIONS_LIMIT - user.trial_questions_used),
         "has_own_api_key": user_has_configured_provider(user_id),
     }
 
@@ -978,7 +980,7 @@ def get_profile(authorization: Optional[str] = Header(None)):
         "user_id": user_id,
         "username": user.email or user.username,
         "supported_providers": SUPPORTED_PROVIDERS,
-        "free_questions_remaining": max(0, 1 - user.trial_questions_used),
+        "free_questions_remaining": max(0, TRIAL_QUESTIONS_LIMIT - user.trial_questions_used),
         "has_own_api_key": user_has_configured_provider(user_id),
     }
 
