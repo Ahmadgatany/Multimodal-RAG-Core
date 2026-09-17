@@ -867,7 +867,7 @@ def _release_trial_question(user_id: str) -> None:
         return
     try:
         db.query(User).filter(User.id == user_id, User.trial_questions_used > 0).update(
-            {User.trial_questions_used: 0}, synchronize_session=False
+            {User.trial_questions_used: User.trial_questions_used - 1}, synchronize_session=False
         )
         db.commit()
     finally:
@@ -883,6 +883,10 @@ def _provider_error_message(error: Exception) -> str:
         return "The API key was rejected. Check the key and selected provider in Model Settings."
     if "rate limit" in message or "too many requests" in message:
         return "Your API provider rate limit was reached. Please wait and try again."
+    if "google_api_key is required" in message:
+        return "Google Gemini is not configured on the server. Set GOOGLE_API_KEY in the Railway Backend variables."
+    if "openrouter_api_key is required" in message:
+        return "OpenRouter is not configured on the server. Set OPENROUTER_API_KEY in the Railway Backend variables."
     return "The model provider could not complete the request. Verify your API key, model name, and provider account."
 
 

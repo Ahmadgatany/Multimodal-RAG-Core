@@ -578,10 +578,10 @@ export default function Home() {
             {freeQuestionsRemaining !== null && (
               <div className={freeQuestionsRemaining > 0 ? "success" : "trial-limit"}>
                 {freeQuestionsRemaining > 0 ? (
-                  <>You have 1 free question remaining. You can use it now without an API key; after that, add and enable your own API key to continue.</>
+                  <>You have {freeQuestionsRemaining} free questions remaining. You can use them without an API key; after that, add and enable your own API key to continue.</>
                 ) : (
                   <>
-                    Your free question has been used. To continue chatting, add and enable your own API key.
+                    Your free questions have been used. To continue chatting, add and enable your own API key.
                     <button type="button" className="settings-link" onClick={openModelSettings}>Open Model Settings</button>
                   </>
                 )}
