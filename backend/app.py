@@ -887,7 +887,50 @@ def _provider_error_message(error: Exception) -> str:
         return "Google Gemini is not configured on the server. Set GOOGLE_API_KEY in the Railway Backend variables."
     if "openrouter_api_key is required" in message:
         return "OpenRouter is not configured on the server. Set OPENROUTER_API_KEY in the Railway Backend variables."
-    return "The model provider could not complete the request. Verify your API key, model name, and provider account."
+    if any(term in message for term in ("model not found", "model_not_found", "unknown model", "unsupported model", "was not found", "does not exist", "no endpoints found", "not available for this model")):
+        return "The selected model is unavailable for this provider or API key. Check the exact model name and that your account can access it."
+    if any(term in message for term in ("timed out", "timeout", "deadline exceeded")):
+        return "The model request timed out. Please retry; if it persists, choose a faster model or check the provider status."
+    if any(term in message for term in ("connection error", "connection refused", "network is unreachable", "dns", "temporarily unavailable", "service unavailable", "bad gateway", "internal server error")):
+        return "The model provider is temporarily unavailable or could not be reached. Please retry shortly."
+    if any(term in message for term in ("safety", "blocked", "content filter", "prompt feedback", "finish_reason: safety")):
+        return "The provider blocked this request because of its safety policy. Rephrase the question and try again."
+    if "empty response" in message:
+        return "The model returned an empty response. Please retry or choose a different model."
+    if "output token limit" in message or "max_tokens" in message:
+        return "The model stopped because its output limit was reached. Ask a narrower question or increase the model output limit."
+    return "The model provider returned an unclassified error. Check the server logs using the diagnostic code shown here."
+
+
+def _provider_error_code(error: Exception) -> str:
+    """Return a stable, safe-to-display category for a failed model request."""
+    message = str(error).lower()
+    if any(term in message for term in ("quota", "resource_exhausted", "insufficient_quota", "credit", "billing", "payment required", "balance")):
+        return "PROVIDER_QUOTA_EXHAUSTED"
+    if any(term in message for term in ("invalid api key", "api key not valid", "invalid_api_key", "unauthorized", "authentication")):
+        return "PROVIDER_AUTH_FAILED"
+    if "rate limit" in message or "too many requests" in message:
+        return "PROVIDER_RATE_LIMITED"
+    if "google_api_key is required" in message or "openrouter_api_key is required" in message:
+        return "PROVIDER_NOT_CONFIGURED"
+    if any(term in message for term in ("model not found", "model_not_found", "unknown model", "unsupported model", "was not found", "does not exist", "no endpoints found", "not available for this model")):
+        return "MODEL_UNAVAILABLE"
+    if any(term in message for term in ("timed out", "timeout", "deadline exceeded")):
+        return "PROVIDER_TIMEOUT"
+    if any(term in message for term in ("connection error", "connection refused", "network is unreachable", "dns", "temporarily unavailable", "service unavailable", "bad gateway", "internal server error")):
+        return "PROVIDER_UNREACHABLE"
+    if any(term in message for term in ("safety", "blocked", "content filter", "prompt feedback", "finish_reason: safety")):
+        return "CONTENT_BLOCKED"
+    if "empty response" in message:
+        return "EMPTY_MODEL_RESPONSE"
+    if "output token limit" in message or "max_tokens" in message:
+        return "MODEL_OUTPUT_LIMIT"
+    return "PROVIDER_UNKNOWN_ERROR"
+
+
+def _provider_error_detail(error: Exception) -> dict[str, str]:
+    """Create the public error payload without exposing provider responses or API keys."""
+    return {"code": _provider_error_code(error), "message": _provider_error_message(error)}
 
 
 @app.post("/auth/refresh")
@@ -1268,7 +1311,7 @@ def chat(request: QueryRequest, authorization: Optional[str] = Header(None)):
             return fallback
         if trial_claimed:
             _release_trial_question(user_id)
-        raise HTTPException(502, _provider_error_message(error)) from error
+        raise HTTPException(502, _provider_error_detail(error)) from error
 
 
 @app.post("/chat_with_image")
@@ -1310,7 +1353,7 @@ async def chat_with_image(
         if trial_claimed:
             _release_trial_question(user_id)
         logger.exception(json.dumps({"event": "image_chat_model_failed", "user_id": user_id, "provider": runtime_config.get("provider", "unknown") if "runtime_config" in locals() else "unknown", "model": runtime_config.get("model", "unknown") if "runtime_config" in locals() else "unknown", "error_type": type(error).__name__, "error": str(error)[:500]}))
-        raise HTTPException(502, _provider_error_message(error)) from error
+        raise HTTPException(502, _provider_error_detail(error)) from error
 
 @app.post("/summarize")
 def summarize(conversation_id: str = Query(...), authorization: Optional[str] = Header(None)):

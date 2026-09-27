@@ -51,3 +51,20 @@ def test_provider_credit_errors_have_an_actionable_message():
     message = backend_app._provider_error_message(RuntimeError("HTTP 402: insufficient credit balance"))
 
     assert "credits are exhausted" in message
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected_code", "message_fragment"),
+    [
+        ("404 NOT_FOUND: model gemini-example was not found", "MODEL_UNAVAILABLE", "model is unavailable"),
+        ("requests.exceptions.ConnectTimeout: request timed out", "PROVIDER_TIMEOUT", "timed out"),
+        ("503 service unavailable", "PROVIDER_UNREACHABLE", "temporarily unavailable"),
+        ("Response blocked by safety policy", "CONTENT_BLOCKED", "safety policy"),
+        ("Gemini returned an empty response", "EMPTY_MODEL_RESPONSE", "empty response"),
+    ],
+)
+def test_provider_failures_have_safe_diagnostic_codes(provider_error, expected_code, message_fragment):
+    detail = backend_app._provider_error_detail(RuntimeError(provider_error))
+
+    assert detail["code"] == expected_code
+    assert message_fragment in detail["message"]

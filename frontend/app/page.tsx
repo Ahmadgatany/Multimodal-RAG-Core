@@ -125,8 +125,13 @@ async function request(path: string, options: RequestInit = {}) {
     }
   }
   const data = await response.json().catch(() => ({}));
-  if (!response.ok)
+  if (!response.ok && !(data.detail && typeof data.detail === "object"))
     throw new Error(data.detail || data.message || "حدث خطأ غير متوقع");
+  if (!response.ok) {
+    const code = typeof data.detail.code === "string" ? `[${data.detail.code}] ` : "";
+    const message = typeof data.detail.message === "string" ? data.detail.message : "Request failed unexpectedly.";
+    throw new Error(`${code}${message}`);
+  }
   return data;
 }
 
