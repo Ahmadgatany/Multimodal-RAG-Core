@@ -271,6 +271,22 @@ class RAGCore:
     def _tokens(text: str) -> set[str]:
         return {token for token in re.findall(r"\w+", text.lower()) if len(token) > 2}
 
+    @staticmethod
+    def _ranking_request(question: str) -> bool:
+        """Whether the user asks for an evidence-based selection or ordering."""
+        normalized = question.lower()
+        markers = (
+            "most important", "top", "best", "most relevant", "rank", "ranking",
+            "الأهم", "اهم", "أفضل", "افضل", "الأفضل", "الافضل", "أبرز", "ابرز",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @staticmethod
+    def _requested_item_count(question: str) -> int:
+        """Return an explicit requested list size, limited to the retrieval cap."""
+        match = re.search(r"\b(?:top|best|most important|list)?\s*(\d{1,2})\b", question, flags=re.IGNORECASE)
+        return min(int(match.group(1)), 10) if match else 0
+
     def retrieve(self, query: str, k: int = 5) -> list[dict[str, Any]]:
         candidates = []
         if self.vector_db is not None:
@@ -351,12 +367,26 @@ class RAGCore:
             )
             return {"answer": self.generate_text([{"role": "user", "content": prompt}], image=image), "sources": []}
         records = self._records()
-        matches = self.retrieve(question, k) if records else []
+        requested_count = self._requested_item_count(question) if self._ranking_request(question) else 0
+        matches = self.retrieve(question, max(k, requested_count)) if records else []
         if records and not matches:
             return {"answer": "I could not find enough information in your uploaded documents to answer that question.", "sources": []}
         if matches:
             context = "\n\n".join(f"[Source: {Path(item['source']).name}, page {item.get('page_number') or 'N/A'}]\n{item['text']}" for item in matches)
-            messages = [{"role": "system", "content": "Answer only from the supplied context. If it is insufficient, say so clearly. Do not invent facts."}, {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}{format_instruction}"}]
+            grounding_instruction = (
+                "Answer only from the supplied context. Do not invent facts, skills, or accomplishments. "
+                "If the context does not support the answer, say so clearly."
+            )
+            if self._ranking_request(question):
+                grounding_instruction += (
+                    " For requests for the most important, top, or best items, make a reasonable evidence-based "
+                    "inference even when the document does not explicitly rank them. Rank only items stated in the "
+                    "context, using relevance to the question, prominence, frequency, surrounding context, and direct "
+                    "evidence. For a CV, prioritize clearly listed skills that are also supported by work experience or "
+                    "projects. Briefly label the result as an inferred ranking. Do not refuse merely because no explicit "
+                    "ranking appears in the document; however, state when fewer supported items are available than requested."
+                )
+            messages = [{"role": "system", "content": grounding_instruction}, {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}{format_instruction}"}]
         else:
             messages = [{"role": "user", "content": f"{question}{format_instruction}"}]
         answer = self.generate_text(messages)
