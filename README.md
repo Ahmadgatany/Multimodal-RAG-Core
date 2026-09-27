@@ -226,7 +226,7 @@ Create four Railway services: **backend**, **frontend**, **PostgreSQL**, and **R
 | Frontend | Root directory `/frontend`; build `npm run build`; start `npm start` |
 | PostgreSQL / Redis | Use Railway-managed services and reference variables |
 
-Attach a persistent backend volume at `/app/data` to retain uploaded files, SQLite RAG stores, and FAISS indexes. `NEXT_PUBLIC_API_URL` must point to the public Backend/API HTTPS URL. Configure `ALLOWED_ORIGINS` with the exact public Frontend HTTPS origin. Rebuild the frontend after changing `NEXT_PUBLIC_API_URL` because Next.js exposes it at build time.
+Attach a persistent backend volume at `/app/data` to retain uploaded files, SQLite RAG stores, and FAISS indexes. Chat history is stored in PostgreSQL in production, so it remains available after backend restarts and new deployments. `NEXT_PUBLIC_API_URL` must point to the public Backend/API HTTPS URL. Configure `ALLOWED_ORIGINS` with the exact public Frontend HTTPS origin. Rebuild the frontend after changing `NEXT_PUBLIC_API_URL` because Next.js exposes it at build time.
 
 ### Current hosted deployment
 

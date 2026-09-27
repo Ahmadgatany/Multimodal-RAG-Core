@@ -23,14 +23,14 @@ from sqlalchemy import text
 
 try:
     from .database import Base, SessionLocal, engine
-    from .models import RefreshToken, RevokedToken, User
+    from .models import ChatConversation, ChatMessage, RefreshToken, RevokedToken, User
 except ImportError:  # pragma: no cover
     Base = None
     engine = None
     SessionLocal = None
     RefreshToken = None
     RevokedToken = None
-    User = None
+    ChatConversation = ChatMessage = User = None
 
 try:
     import redis
@@ -466,6 +466,11 @@ def _clear_session_token(token: str) -> None:
 
 
 def _init_chat_history_storage():
+    # Production uses the same PostgreSQL database as accounts.  SQLite remains
+    # a lightweight local-development fallback.
+    if _uses_database_chat_history():
+        _reset_sqlalchemy_schema_if_needed()
+        return
     CHAT_HISTORY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
         connection.execute(
@@ -486,10 +491,34 @@ def _init_chat_history_storage():
         )
 
 
+def _uses_database_chat_history() -> bool:
+    return bool(
+        engine is not None
+        and not DATABASE_URL.startswith("sqlite")
+        and ChatConversation is not None
+        and ChatMessage is not None
+    )
+
+
 def _prune_chat_history(now: Optional[float] = None):
     _init_chat_history_storage()
     current_time = time.time() if now is None else now
     cutoff = current_time - (CHAT_HISTORY_RETENTION_DAYS * 86400)
+    if _uses_database_chat_history():
+        db = _safe_db_session()
+        if db is None:
+            return
+        try:
+            cutoff_at = datetime.utcfromtimestamp(cutoff)
+            stale_ids = [row[0] for row in db.query(ChatConversation.id).filter(ChatConversation.updated_at < cutoff_at).all()]
+            db.query(ChatMessage).filter(ChatMessage.created_at < cutoff_at).delete(synchronize_session=False)
+            if stale_ids:
+                db.query(ChatMessage).filter(ChatMessage.conversation_id.in_(stale_ids)).delete(synchronize_session=False)
+                db.query(ChatConversation).filter(ChatConversation.id.in_(stale_ids)).delete(synchronize_session=False)
+            db.commit()
+        finally:
+            db.close()
+        return
     with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
         connection.execute(
             "DELETE FROM messages WHERE created_at < ?",
@@ -507,6 +536,23 @@ def _prune_chat_history(now: Optional[float] = None):
 def _save_chat_message(user_id: str, role: str, content: str, conversation_id: Optional[str] = None, created_at: Optional[float] = None, title: Optional[str] = None):
     _init_chat_history_storage()
     current_time = float(created_at if created_at is not None else time.time())
+    if _uses_database_chat_history():
+        db = _safe_db_session()
+        if db is None:
+            raise RuntimeError("Chat history database is unavailable")
+        try:
+            current_at = datetime.utcfromtimestamp(current_time)
+            if conversation_id is None:
+                conversation_id = uuid4().hex
+                db.add(ChatConversation(id=conversation_id, user_id=user_id, title=title or content[:40].strip() or "New Chat", created_at=current_at, updated_at=current_at))
+            elif title:
+                db.query(ChatConversation).filter(ChatConversation.id == conversation_id, ChatConversation.title == "New Chat").update({ChatConversation.title: title.strip()}, synchronize_session=False)
+            db.add(ChatMessage(id=uuid4().hex, conversation_id=conversation_id, user_id=user_id, role=role, content=content, created_at=current_at, metadata_json=json.dumps({"title": title or "New Chat"})))
+            db.query(ChatConversation).filter(ChatConversation.id == conversation_id).update({ChatConversation.updated_at: current_at}, synchronize_session=False)
+            db.commit()
+            return conversation_id
+        finally:
+            db.close()
     if conversation_id is None:
         conversation_id = _create_conversation(user_id, title or content[:40].strip() or "New Chat", current_time)
 
@@ -532,6 +578,17 @@ def _create_conversation(user_id: str, title: str = "New Chat", created_at: Opti
     _init_chat_history_storage()
     current_time = float(created_at if created_at is not None else time.time())
     conversation_id = uuid4().hex
+    if _uses_database_chat_history():
+        db = _safe_db_session()
+        if db is None:
+            raise RuntimeError("Chat history database is unavailable")
+        try:
+            current_at = datetime.utcfromtimestamp(current_time)
+            db.add(ChatConversation(id=conversation_id, user_id=user_id, title=title, created_at=current_at, updated_at=current_at))
+            db.commit()
+        finally:
+            db.close()
+        return conversation_id
     with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
         connection.execute(
             "INSERT INTO conversations (id, user_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -542,6 +599,15 @@ def _create_conversation(user_id: str, title: str = "New Chat", created_at: Opti
 
 def _get_user_conversations(user_id: str):
     _init_chat_history_storage()
+    if _uses_database_chat_history():
+        db = _safe_db_session()
+        if db is None:
+            raise RuntimeError("Chat history database is unavailable")
+        try:
+            rows = db.query(ChatConversation).filter(ChatConversation.user_id == user_id).order_by(ChatConversation.updated_at.desc()).all()
+            return [{"id": row.id, "title": row.title, "created_at": row.created_at.timestamp(), "updated_at": row.updated_at.timestamp()} for row in rows]
+        finally:
+            db.close()
     with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
         rows = connection.execute(
             "SELECT id, title, created_at, updated_at FROM conversations WHERE user_id = ? ORDER BY updated_at DESC",
@@ -560,6 +626,15 @@ def _get_user_conversations(user_id: str):
 
 def _get_conversation_messages(user_id: str, conversation_id: str):
     _init_chat_history_storage()
+    if _uses_database_chat_history():
+        db = _safe_db_session()
+        if db is None:
+            raise RuntimeError("Chat history database is unavailable")
+        try:
+            rows = db.query(ChatMessage).filter(ChatMessage.user_id == user_id, ChatMessage.conversation_id == conversation_id).order_by(ChatMessage.created_at.asc()).all()
+            return [{"role": row.role, "content": row.content, "created_at": row.created_at.timestamp()} for row in rows]
+        finally:
+            db.close()
     with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
         rows = connection.execute(
             "SELECT role, content, created_at FROM messages WHERE user_id = ? AND conversation_id = ? ORDER BY created_at ASC",
@@ -707,6 +782,14 @@ def _require_user(user_id: str) -> User:
 
 def _conversation_exists(user_id: str, conversation_id: str) -> bool:
     _init_chat_history_storage()
+    if _uses_database_chat_history():
+        db = _safe_db_session()
+        if db is None:
+            return False
+        try:
+            return db.query(ChatConversation.id).filter(ChatConversation.id == conversation_id, ChatConversation.user_id == user_id).first() is not None
+        finally:
+            db.close()
     with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
         return connection.execute(
             "SELECT 1 FROM conversations WHERE id = ? AND user_id = ?",
@@ -1056,6 +1139,19 @@ def delete_conversation(conversation_id: str, authorization: Optional[str] = Hea
     """Delete a conversation and all its messages."""
     user_id = _current_user(authorization)
     _init_chat_history_storage()
+    if _uses_database_chat_history():
+        db = _safe_db_session()
+        if db is None:
+            raise HTTPException(503, "Chat history database is unavailable")
+        try:
+            conversation = db.query(ChatConversation).filter(ChatConversation.id == conversation_id, ChatConversation.user_id == user_id).first()
+            if conversation is None:
+                raise HTTPException(403, "Unauthorized to delete this conversation")
+            db.delete(conversation)
+            db.commit()
+            return {"status": "deleted", "conversation_id": conversation_id}
+        finally:
+            db.close()
     
     try:
         with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
@@ -1190,9 +1286,18 @@ def metrics(metrics_token: Optional[str] = Header(None, alias="X-Metrics-Token")
         finally:
             db.close()
     _init_chat_history_storage()
-    with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
-        usage["conversations"] = connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
-        usage["messages"] = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    if _uses_database_chat_history():
+        db = _safe_db_session()
+        if db is not None:
+            try:
+                usage["conversations"] = db.query(ChatConversation).count()
+                usage["messages"] = db.query(ChatMessage).count()
+            finally:
+                db.close()
+    else:
+        with sqlite3.connect(CHAT_HISTORY_DB_PATH) as connection:
+            usage["conversations"] = connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+            usage["messages"] = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     return {
         **usage,
         "requests": request_count,

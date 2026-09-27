@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from backend.config import DATABASE_URL
 from backend.database import Base
-from backend.models import User, RefreshToken, RevokedToken
+from backend.models import ChatConversation, ChatMessage, User, RefreshToken, RevokedToken
 
 config = context.config
 if config.config_file_name is not None:
