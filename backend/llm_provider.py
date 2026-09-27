@@ -6,6 +6,18 @@ from typing import Optional
 from PIL import Image
 
 
+class ProviderRequestError(RuntimeError):
+    """A sanitized provider failure suitable for logs and API error mapping."""
+
+    def __init__(self, provider: str, message: str, status_code: Optional[int] = None):
+        self.provider = provider
+        self.status_code = status_code
+        prefix = f"{provider} request failed"
+        if status_code is not None:
+            prefix += f" ({status_code})"
+        super().__init__(f"{prefix}: {message[:500]}")
+
+
 class GeminiProvider:
     """Small provider boundary so the RAG pipeline is independent of an LLM vendor."""
 
@@ -37,14 +49,19 @@ class GeminiProvider:
                 )
             )
 
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                max_output_tokens=max_output_tokens,
-                temperature=0.2,
-            ),
-        )
+        try:
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    max_output_tokens=max_output_tokens,
+                    temperature=0.2,
+                ),
+            )
+        except Exception as error:
+            status_code = getattr(error, "status_code", None) or getattr(error, "code", None)
+            status_code = status_code if isinstance(status_code, int) else None
+            raise ProviderRequestError("Gemini", str(error), status_code) from error
         text = getattr(response, "text", None)
         if not text:
             raise RuntimeError("Gemini returned an empty response")
@@ -88,36 +105,42 @@ class OpenRouterProvider:
                 }
             )
 
-        response = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": self.site_url,
-                "X-Title": self.app_name,
-            },
-            json={
-                "model": self.model,
-                "messages": [{"role": "user", "content": content}],
-                "max_tokens": max_output_tokens,
-                "temperature": 0.2,
-            },
-            timeout=120,
-        )
+        try:
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": self.site_url,
+                    "X-Title": self.app_name,
+                },
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": content}],
+                    "max_tokens": max_output_tokens,
+                    "temperature": 0.2,
+                },
+                timeout=120,
+            )
+        except requests.RequestException as error:
+            raise ProviderRequestError("OpenRouter", str(error)) from error
         if not response.ok:
-            raise RuntimeError(f"OpenRouter request failed ({response.status_code}): {response.text[:500]}")
-        payload = response.json()
+            raise ProviderRequestError("OpenRouter", response.text, response.status_code)
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise ProviderRequestError("OpenRouter", "provider returned invalid JSON", response.status_code) from error
         if payload.get("error"):
             error = payload["error"]
             if isinstance(error, dict):
                 message = error.get("message") or "Unknown OpenRouter error"
                 code = error.get("code")
-                raise RuntimeError(f"OpenRouter provider error ({code}): {message}")
-            raise RuntimeError(f"OpenRouter provider error: {error}")
+                raise ProviderRequestError("OpenRouter", f"{code}: {message}", response.status_code)
+            raise ProviderRequestError("OpenRouter", str(error), response.status_code)
         try:
             text = payload["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:
-            raise RuntimeError("OpenRouter returned an unexpected response") from error
+            raise ProviderRequestError("OpenRouter", "provider returned an unexpected response", response.status_code) from error
         if not text:
             raise RuntimeError("OpenRouter returned an empty response")
         return text.strip()

@@ -970,6 +970,10 @@ def _provider_error_message(error: Exception) -> str:
         return "Google Gemini is not configured on the server. Set GOOGLE_API_KEY in the Railway Backend variables."
     if "openrouter_api_key is required" in message:
         return "OpenRouter is not configured on the server. Set OPENROUTER_API_KEY in the Railway Backend variables."
+    if any(term in message for term in ("context length", "context window", "input too long", "prompt is too long", "too many tokens", "request too large", "request failed (413)")):
+        return "The retrieved context is too large for the selected model. Please retry with a narrower question or a model with a larger context window."
+    if any(term in message for term in ("invalid argument", "invalid_argument", "bad request", "request failed (400)", "request failed (422)")):
+        return "The model provider rejected the request format or parameters. Check the selected model and provider configuration."
     if any(term in message for term in ("model not found", "model_not_found", "unknown model", "unsupported model", "was not found", "does not exist", "no endpoints found", "not available for this model")):
         return "The selected model is unavailable for this provider or API key. Check the exact model name and that your account can access it."
     if any(term in message for term in ("timed out", "timeout", "deadline exceeded")):
@@ -996,6 +1000,10 @@ def _provider_error_code(error: Exception) -> str:
         return "PROVIDER_RATE_LIMITED"
     if "google_api_key is required" in message or "openrouter_api_key is required" in message:
         return "PROVIDER_NOT_CONFIGURED"
+    if any(term in message for term in ("context length", "context window", "input too long", "prompt is too long", "too many tokens", "request too large", "request failed (413)")):
+        return "PROMPT_TOO_LARGE"
+    if any(term in message for term in ("invalid argument", "invalid_argument", "bad request", "request failed (400)", "request failed (422)")):
+        return "PROVIDER_REQUEST_INVALID"
     if any(term in message for term in ("model not found", "model_not_found", "unknown model", "unsupported model", "was not found", "does not exist", "no endpoints found", "not available for this model")):
         return "MODEL_UNAVAILABLE"
     if any(term in message for term in ("timed out", "timeout", "deadline exceeded")):

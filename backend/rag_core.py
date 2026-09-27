@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import sqlite3
 import time
@@ -10,6 +11,10 @@ from uuid import uuid4
 
 from PIL import Image
 import requests
+
+
+logger = logging.getLogger("multimodal_rag")
+MAX_RAG_CONTEXT_CHARS = 24_000
 
 try:
     from .config import DB_PATH, EMBEDDING_MODEL, EMBEDDING_PROVIDER, GOOGLE_API_KEY, OPENROUTER_API_KEY, OPENROUTER_APP_NAME, OPENROUTER_SITE_URL, UPLOAD_DIR, USE_VECTOR_DB, get_runtime_provider_config
@@ -287,6 +292,20 @@ class RAGCore:
         match = re.search(r"\b(?:top|best|most important|list)?\s*(\d{1,2})\b", question, flags=re.IGNORECASE)
         return min(int(match.group(1)), 10) if match else 0
 
+    @staticmethod
+    def _context_from_matches(matches: list[dict[str, Any]], max_chars: int = MAX_RAG_CONTEXT_CHARS) -> str:
+        """Build a bounded, source-labelled context that stays within provider limits."""
+        sections: list[str] = []
+        remaining = max_chars
+        for item in matches:
+            header = f"[Source: {Path(item['source']).name}, page {item.get('page_number') or 'N/A'}]\n"
+            if remaining <= len(header):
+                break
+            excerpt = str(item["text"])[: remaining - len(header)]
+            sections.append(header + excerpt)
+            remaining -= len(header) + len(excerpt) + 2
+        return "\n\n".join(sections)
+
     def retrieve(self, query: str, k: int = 5) -> list[dict[str, Any]]:
         candidates = []
         if self.vector_db is not None:
@@ -372,7 +391,7 @@ class RAGCore:
         if records and not matches:
             return {"answer": "I could not find enough information in your uploaded documents to answer that question.", "sources": []}
         if matches:
-            context = "\n\n".join(f"[Source: {Path(item['source']).name}, page {item.get('page_number') or 'N/A'}]\n{item['text']}" for item in matches)
+            context = self._context_from_matches(matches)
             grounding_instruction = (
                 "Answer only from the supplied context. Do not invent facts, skills, or accomplishments. "
                 "If the context does not support the answer, say so clearly."
@@ -387,6 +406,10 @@ class RAGCore:
                     "ranking appears in the document; however, state when fewer supported items are available than requested."
                 )
             messages = [{"role": "system", "content": grounding_instruction}, {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}{format_instruction}"}]
+            logger.info(
+                "rag_prompt_ready chunks=%s context_chars=%s ranking_request=%s question_chars=%s",
+                len(matches), len(context), self._ranking_request(question), len(question),
+            )
         else:
             messages = [{"role": "user", "content": f"{question}{format_instruction}"}]
         answer = self.generate_text(messages)

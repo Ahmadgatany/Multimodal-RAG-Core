@@ -56,3 +56,35 @@ def test_non_ranking_question_does_not_add_ranking_instruction(tmp_path):
     agent.answer_with_sources("What language does the candidate use?")
 
     assert "reasonable evidence-based inference" not in captured["system"]
+
+
+def test_exact_cv_ranking_query_keeps_retrieved_skill_context_within_limit(tmp_path):
+    agent = RAGCore(upload_dir=str(tmp_path / "uploads"), db_path=str(tmp_path / "rag.sqlite3"))
+    agent.use_vector_db = False
+    matches = [
+        {
+            "document_id": "cv",
+            "source": "cv.txt",
+            "page_number": index,
+            "text": f"Skills section {index}: Python, SQL, Docker, React. " + "evidence " * 2_000,
+        }
+        for index in range(1, 7)
+    ]
+    captured = {}
+
+    agent._records = lambda: matches
+    agent.retrieve = lambda question, k=5: matches[:k]
+
+    def fake_generate(messages, image=None, max_new_tokens=1024):
+        captured["messages"] = messages
+        return "ranking"
+
+    agent.generate_text = fake_generate
+
+    result = agent.answer_with_sources("List the 6 most important skills for a CV holder.", k=1)
+
+    prompt = captured["messages"][1]["content"]
+    assert result["answer"] == "ranking"
+    assert "Skills section 1: Python, SQL, Docker, React." in prompt
+    assert len(prompt) <= 25_000
+    assert len(RAGCore._context_from_matches(matches)) <= 24_000
