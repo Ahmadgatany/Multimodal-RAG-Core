@@ -49,14 +49,19 @@ class GeminiProvider:
                 )
             )
 
+        # Gemini 3.x is tuned for the API defaults. Explicit sampling values
+        # (including the legacy low temperature used for 2.x models) can cause
+        # poor or rejected generation requests, so omit temperature entirely.
+        model_id = self.model.removeprefix("models/").lower()
+        generation_options = {"max_output_tokens": max_output_tokens}
+        if not model_id.startswith("gemini-3"):
+            generation_options["temperature"] = 0.2
+
         try:
             response = self.client.models.generate_content(
                 model=self.model,
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    max_output_tokens=max_output_tokens,
-                    temperature=0.2,
-                ),
+                config=types.GenerateContentConfig(**generation_options),
             )
         except Exception as error:
             status_code = getattr(error, "status_code", None) or getattr(error, "code", None)
