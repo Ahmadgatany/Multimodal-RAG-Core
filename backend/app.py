@@ -966,6 +966,8 @@ def _provider_error_message(error: Exception) -> str:
         return "The API key was rejected. Check the key and selected provider in Model Settings."
     if "rate limit" in message or "too many requests" in message:
         return "Your API provider rate limit was reached. Please wait and try again."
+    if "high demand" in message or "overloaded" in message or "503 unavailable" in message or "request failed (503)" in message:
+        return "Gemini is temporarily experiencing high demand. Please try again in a few moments."
     if "google_api_key is required" in message:
         return "Google Gemini is not configured on the server. Set GOOGLE_API_KEY in the Railway Backend variables."
     if "openrouter_api_key is required" in message:
@@ -998,6 +1000,8 @@ def _provider_error_code(error: Exception) -> str:
         return "PROVIDER_AUTH_FAILED"
     if "rate limit" in message or "too many requests" in message:
         return "PROVIDER_RATE_LIMITED"
+    if "high demand" in message or "overloaded" in message or "503 unavailable" in message or "request failed (503)" in message:
+        return "PROVIDER_OVERLOADED"
     if "google_api_key is required" in message or "openrouter_api_key is required" in message:
         return "PROVIDER_NOT_CONFIGURED"
     if any(term in message for term in ("context length", "context window", "input too long", "prompt is too long", "too many tokens", "request too large", "request failed (413)")):

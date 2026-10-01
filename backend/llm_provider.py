@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from io import BytesIO
 from typing import Optional
 
@@ -57,16 +58,23 @@ class GeminiProvider:
         if not model_id.startswith("gemini-3"):
             generation_options["temperature"] = 0.2
 
-        try:
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=contents,
-                config=types.GenerateContentConfig(**generation_options),
-            )
-        except Exception as error:
-            status_code = getattr(error, "status_code", None) or getattr(error, "code", None)
-            status_code = status_code if isinstance(status_code, int) else None
-            raise ProviderRequestError("Gemini", str(error), status_code) from error
+        for attempt in range(2):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=contents,
+                    config=types.GenerateContentConfig(**generation_options),
+                )
+                break
+            except Exception as error:
+                status_code = getattr(error, "status_code", None) or getattr(error, "code", None)
+                status_code = status_code if isinstance(status_code, int) else None
+                error_text = str(error)
+                is_temporary_overload = status_code == 503 or "503 UNAVAILABLE" in error_text.upper()
+                if is_temporary_overload and attempt == 0:
+                    time.sleep(1)
+                    continue
+                raise ProviderRequestError("Gemini", error_text, status_code) from error
         text = getattr(response, "text", None)
         if not text:
             raise RuntimeError("Gemini returned an empty response")
