@@ -31,7 +31,7 @@ def test_provider_context_limit_error_is_not_reported_as_unknown():
     assert "context is too large" in detail["message"]
 
 
-def test_gemini_3_uses_low_thinking_without_exposing_thoughts(monkeypatch):
+def test_gemini_3_generation_config_matches_pinned_sdk_schema(monkeypatch):
     from backend.llm_provider import GeminiProvider
 
     captured = {}
@@ -49,6 +49,7 @@ def test_gemini_3_uses_low_thinking_without_exposing_thoughts(monkeypatch):
 
     config = captured["config"]
     assert config.max_output_tokens == 2048
-    assert config.thinking_config.thinking_level.name == "LOW"
-    assert config.thinking_config.include_thoughts is False
+    # google-genai==1.0.0 accepts include_thoughts, but not thinking_level or
+    # thinking_budget. Keep the serialized config within that production schema.
+    assert config.thinking_config.model_dump(exclude_none=True) == {"include_thoughts": False}
     assert config.temperature is None

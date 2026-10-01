@@ -56,10 +56,10 @@ class GeminiProvider:
         model_id = self.model.removeprefix("models/").lower()
         generation_options = {"max_output_tokens": max_output_tokens}
         if model_id.startswith("gemini-3"):
-            # Gemini 3 defaults to high internal reasoning; its thought tokens
-            # count against max_output_tokens and can leave concise RAG answers truncated.
+            # The pinned google-genai 1.0.0 schema only supports include_thoughts
+            # here; thinking_level and thinking_budget are not valid fields.
+            # Leave model thinking enabled at its default while suppressing thought output.
             generation_options["thinking_config"] = types.ThinkingConfig(
-                thinking_level="low",
                 include_thoughts=False,
             )
         else:
