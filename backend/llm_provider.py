@@ -55,7 +55,14 @@ class GeminiProvider:
         # poor or rejected generation requests, so omit temperature entirely.
         model_id = self.model.removeprefix("models/").lower()
         generation_options = {"max_output_tokens": max_output_tokens}
-        if not model_id.startswith("gemini-3"):
+        if model_id.startswith("gemini-3"):
+            # Gemini 3 defaults to high internal reasoning; its thought tokens
+            # count against max_output_tokens and can leave concise RAG answers truncated.
+            generation_options["thinking_config"] = types.ThinkingConfig(
+                thinking_level="low",
+                include_thoughts=False,
+            )
+        else:
             generation_options["temperature"] = 0.2
 
         for attempt in range(2):

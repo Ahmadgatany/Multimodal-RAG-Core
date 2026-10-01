@@ -29,3 +29,26 @@ def test_provider_context_limit_error_is_not_reported_as_unknown():
 
     assert detail["code"] == "PROMPT_TOO_LARGE"
     assert "context is too large" in detail["message"]
+
+
+def test_gemini_3_uses_low_thinking_without_exposing_thoughts(monkeypatch):
+    from backend.llm_provider import GeminiProvider
+
+    captured = {}
+
+    class Models:
+        def generate_content(self, **kwargs):
+            captured.update(kwargs)
+            return type("Response", (), {"text": "Concise answer.", "candidates": []})()
+
+    provider = GeminiProvider.__new__(GeminiProvider)
+    provider.client = type("Client", (), {"models": Models()})()
+    provider.model = "gemini-3.6-flash"
+
+    assert provider.generate("RAG prompt", max_output_tokens=2048) == "Concise answer."
+
+    config = captured["config"]
+    assert config.max_output_tokens == 2048
+    assert config.thinking_config.thinking_level.name == "LOW"
+    assert config.thinking_config.include_thoughts is False
+    assert config.temperature is None

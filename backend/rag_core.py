@@ -15,6 +15,8 @@ import requests
 
 logger = logging.getLogger("multimodal_rag")
 MAX_RAG_CONTEXT_CHARS = 24_000
+RAG_DEFAULT_OUTPUT_TOKENS = 2_048
+RAG_DETAILED_OUTPUT_TOKENS = 4_096
 
 try:
     from .config import DB_PATH, EMBEDDING_MODEL, EMBEDDING_PROVIDER, GOOGLE_API_KEY, OPENROUTER_API_KEY, OPENROUTER_APP_NAME, OPENROUTER_SITE_URL, UPLOAD_DIR, USE_VECTOR_DB, get_runtime_provider_config
@@ -281,8 +283,19 @@ class RAGCore:
         """Whether the user asks for an evidence-based selection or ordering."""
         normalized = question.lower()
         markers = (
-            "most important", "top", "best", "most relevant", "rank", "ranking",
+            "most important", "top", "best", "strongest", "most relevant", "rank", "ranking",
             "الأهم", "اهم", "أفضل", "افضل", "الأفضل", "الافضل", "أبرز", "ابرز",
+        )
+        return any(marker in normalized for marker in markers)
+
+    @staticmethod
+    def _requests_detail(question: str) -> bool:
+        """Whether the user explicitly requests a detailed or extended answer."""
+        normalized = question.lower()
+        markers = (
+            "in detail", "detailed", "elaborate", "comprehensive", "explain fully",
+            "explain in depth", "go into depth", "provide depth", "تفصيلاً", "بالتفصيل",
+            "شرح مفصل", "اشرح بالتفصيل",
         )
         return any(marker in normalized for marker in markers)
 
@@ -372,6 +385,7 @@ class RAGCore:
 
     def answer_with_sources(self, question: str, image: Optional[Image.Image] = None, k: int = 5) -> dict[str, Any]:
         image = image or self._latest_image()
+        output_tokens = RAG_DETAILED_OUTPUT_TOKENS if self._requests_detail(question) else RAG_DEFAULT_OUTPUT_TOKENS
         format_instruction = ""
         if "4" in question and ("سطر" in question or "سطور" in question or "line" in question.lower()):
             format_instruction = "\n\nأجب في 4 أسطر فقط، واجعل كل سطر جملة مفيدة ومكتملة. لا تقطع الجملة ولا تضف مقدمة أو خاتمة."
@@ -381,10 +395,12 @@ class RAGCore:
                 "Inspect the invoice itself, not general meanings of the words in the question. "
                 "For questions asking who the invoice is from and to whom, identify the sender/supplier and recipient/customer "
                 "exactly as written on the invoice. If a field is unreadable or absent, say that clearly. "
-                "Answer in the same language as the user and do not invent details.\n\n"
+                "Answer in the same language as the user. Keep simple answers to 1-5 lines and standard answers to at most "
+                "25 lines. Be concise, avoid repeating facts, and never reveal internal reasoning or raw context. "
+                "Give a longer answer only when explicitly requested. Do not invent details.\n\n"
                 f"User question: {question}{format_instruction}"
             )
-            return {"answer": self.generate_text([{"role": "user", "content": prompt}], image=image), "sources": []}
+            return {"answer": self.generate_text([{"role": "user", "content": prompt}], image=image, max_new_tokens=output_tokens), "sources": []}
         records = self._records()
         requested_count = self._requested_item_count(question) if self._ranking_request(question) else 0
         matches = self.retrieve(question, max(k, requested_count)) if records else []
@@ -393,23 +409,20 @@ class RAGCore:
         if matches:
             context = self._context_from_matches(matches)
             grounding_instruction = (
-                "Answer the user's question using only the supplied context. Treat the context as evidence, not as a "
-                "complete answer template: reason over it and synthesize conclusions when its facts support them, "
-                "even when the document does not state the conclusion or ranking explicitly. This applies to factual "
-                "questions, strengths, suitability, comparisons, summaries, implications, and other natural-language "
-                "questions. Explain the evidence behind an inference briefly and distinguish inference from directly "
-                "stated facts when useful. Never invent facts, skills, experience, numbers, or events absent from the "
-                "context. If the retrieved evidence genuinely cannot support the requested answer, say so clearly. "
-                "Preserve source/page references present in the context when citing evidence."
+                "Answer in the user's language using only the supplied context. Treat context as evidence: answer direct "
+                "questions and synthesize supported conclusions about strengths, suitability, comparisons, summaries, or "
+                "implications even if unstated verbatim. Never invent facts, skills, experience, numbers, or events. If "
+                "evidence is insufficient, say so. Preserve source/page references when citing. Keep simple answers to 1-5 "
+                "lines and standard answers to at most 25 lines. Give longer answers only when explicitly requested. "
+                "Reason internally; never reveal chain-of-thought, internal reasoning steps, or raw context. Deduplicate "
+                "facts and give only brief supporting evidence; distinguish inferences from stated facts when useful."
             )
             if self._ranking_request(question):
                 grounding_instruction += (
-                    " For requests for the most important, top, or best items, make a reasonable evidence-based "
-                    "inference even when the document does not explicitly rank them. Rank only items stated in the "
-                    "context, using relevance to the question, prominence, frequency, surrounding context, and direct "
-                    "evidence. For a CV, prioritize clearly listed skills that are also supported by work experience or "
-                    "projects. Briefly label the result as an inferred ranking. Do not refuse merely because no explicit "
-                    "ranking appears in the document; however, state when fewer supported items are available than requested."
+                    " For a requested selection or ranking, select only supported items and prioritize those with the "
+                    "strongest direct evidence and relevance. Do not require the document to state an explicit ranking; "
+                    "for CVs, prioritize listed skills supported by work or projects, and say when fewer supported items "
+                    "exist than requested."
                 )
             messages = [{"role": "system", "content": grounding_instruction}, {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}{format_instruction}"}]
             logger.info(
@@ -418,7 +431,7 @@ class RAGCore:
             )
         else:
             messages = [{"role": "user", "content": f"{question}{format_instruction}"}]
-        answer = self.generate_text(messages)
+        answer = self.generate_text(messages, max_new_tokens=output_tokens)
         seen, sources = set(), []
         for item in matches:
             key = (item["source"], item.get("page_number"))
