@@ -393,8 +393,14 @@ class RAGCore:
         if matches:
             context = self._context_from_matches(matches)
             grounding_instruction = (
-                "Answer only from the supplied context. Do not invent facts, skills, or accomplishments. "
-                "If the context does not support the answer, say so clearly."
+                "Answer the user's question using only the supplied context. Treat the context as evidence, not as a "
+                "complete answer template: reason over it and synthesize conclusions when its facts support them, "
+                "even when the document does not state the conclusion or ranking explicitly. This applies to factual "
+                "questions, strengths, suitability, comparisons, summaries, implications, and other natural-language "
+                "questions. Explain the evidence behind an inference briefly and distinguish inference from directly "
+                "stated facts when useful. Never invent facts, skills, experience, numbers, or events absent from the "
+                "context. If the retrieved evidence genuinely cannot support the requested answer, say so clearly. "
+                "Preserve source/page references present in the context when citing evidence."
             )
             if self._ranking_request(question):
                 grounding_instruction += (

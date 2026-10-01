@@ -33,7 +33,7 @@ def test_cv_ranking_request_uses_evidence_based_inference_prompt(tmp_path):
     assert result["answer"].startswith("Inferred ranking")
     assert "reasonable evidence-based inference" in system_prompt
     assert "prioritize clearly listed skills" in system_prompt
-    assert "Do not invent facts, skills, or accomplishments" in system_prompt
+    assert "Never invent facts, skills, experience, numbers, or events" in system_prompt
     assert "Python data pipelines" in captured["messages"][1]["content"]
     assert captured["retrieval_k"] == 6
     assert RAGCore._requested_item_count("List the 6 most important skills") == 6
@@ -56,6 +56,58 @@ def test_non_ranking_question_does_not_add_ranking_instruction(tmp_path):
     agent.answer_with_sources("What language does the candidate use?")
 
     assert "reasonable evidence-based inference" not in captured["system"]
+
+
+def test_general_grounding_prompt_allows_supported_synthesis_for_strengths_question(tmp_path):
+    text_file = tmp_path / "cv.txt"
+    text_file.write_text(
+        "Skills: Python, SQL, Docker. Built Python data pipelines and SQL dashboards. "
+        "Deployed Docker services for production analytics.",
+        encoding="utf-8",
+    )
+    agent = RAGCore(upload_dir=str(tmp_path / "uploads"), db_path=str(tmp_path / "rag.sqlite3"))
+    agent.use_vector_db = False
+    document_id = agent.create_ingestion_job(text_file.name)
+    agent.ingest_file(document_id, str(text_file))
+    captured = {}
+
+    def fake_generate(messages, image=None, max_new_tokens=1024):
+        captured["messages"] = messages
+        return "The strongest areas appear to be Python, SQL, and Docker, based on the described projects."
+
+    agent.generate_text = fake_generate
+    result = agent.answer_with_sources("What are the strongest technical areas in this CV?")
+
+    system_prompt = captured["messages"][0]["content"]
+    assert "synthesize conclusions when its facts support them" in system_prompt
+    assert "strengths, suitability, comparisons" in system_prompt
+    assert "Never invent facts, skills, experience, numbers, or events" in system_prompt
+    assert "Python data pipelines" in captured["messages"][1]["content"]
+    assert result["answer"].startswith("The strongest areas")
+    assert result["sources"][0]["filename"] == "cv.txt"
+    assert result["sources"][0]["page_number"] == 1
+
+
+def test_direct_factual_question_keeps_same_grounding_behavior(tmp_path):
+    text_file = tmp_path / "profile.txt"
+    text_file.write_text("The candidate uses Python for data analysis.", encoding="utf-8")
+    agent = RAGCore(upload_dir=str(tmp_path / "uploads"), db_path=str(tmp_path / "rag.sqlite3"))
+    agent.use_vector_db = False
+    document_id = agent.create_ingestion_job(text_file.name)
+    agent.ingest_file(document_id, str(text_file))
+    captured = {}
+
+    def fake_generate(messages, image=None, max_new_tokens=1024):
+        captured["messages"] = messages
+        return "The candidate uses Python for data analysis."
+
+    agent.generate_text = fake_generate
+    result = agent.answer_with_sources("What language does the candidate use?")
+
+    assert result["answer"] == "The candidate uses Python for data analysis."
+    assert "only the supplied context" in captured["messages"][0]["content"]
+    assert "Python for data analysis" in captured["messages"][1]["content"]
+    assert result["sources"][0]["page_number"] == 1
 
 
 def test_exact_cv_ranking_query_keeps_retrieved_skill_context_within_limit(tmp_path):
