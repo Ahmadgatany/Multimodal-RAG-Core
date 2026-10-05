@@ -81,7 +81,7 @@ function AssistantResponse({ content }: { content: string }) {
   });
   flushBullets();
 
-  return <div className="assistant-response">{elements}</div>;
+  return <div className="assistant-response" dir="auto">{elements}</div>;
 }
 
 function conversationTitle(text: string) {
@@ -619,7 +619,7 @@ export default function Home() {
                           <UserRound size={15} />
                         )}
                       </div>
-                      <div className="message-bubble">
+                      <div className="message-bubble" dir="auto">
                         {message.role === "assistant" ? (
                           <AssistantResponse content={message.content} />
                         ) : (
@@ -634,7 +634,7 @@ export default function Home() {
                     <div className="message-avatar">
                       <Bot size={15} />
                     </div>
-                    <div className="message-bubble">
+                    <div className="message-bubble" dir="auto">
                       أفكر في إجابة مناسبة...
                     </div>
                   </div>
@@ -643,6 +643,7 @@ export default function Home() {
               <form className="composer" onSubmit={sendMessage}>
                 <div className="composer-box">
                   <textarea
+                    dir="auto"
                     value={question}
                     onChange={(e) => setQuestion(e.target.value)}
                     onKeyDown={(e) => {
