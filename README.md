@@ -4,6 +4,14 @@
 
 **Multimodal RAG Core** combines a Next.js client with a FastAPI retrieval pipeline to deliver secure, conversation-scoped document Q&A. The interface and generated responses are designed for Arabic and English workflows.
 
+## Demo
+
+The two-minute project walkthrough will be embedded here. Add the video at `assets/demo.mp4` in the repository, then this player will display it on GitHub:
+
+<video src="assets/demo.mp4" controls width="100%"></video>
+
+For a smaller repository, host the video (for example, as a GitHub release asset) and replace the `src` above with its public URL.
+
 ## Why this project
 
 - **Grounded answers** — retrieves relevant passages before asking the model to answer, with filename and page references returned alongside the response.
