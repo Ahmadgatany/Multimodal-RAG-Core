@@ -6,11 +6,9 @@
 
 ## Demo
 
-Watch the two-minute walkthrough of Multimodal RAG Core:
+Take a two-minute walkthrough of Multimodal RAG Core:
 
-[▶ Watch the project demo](assets/demo.mp4)
-
-The video is included in this repository at [`assets/demo.mp4`](assets/demo.mp4). GitHub does not render repository-stored MP4 files as inline players in README pages. To show an inline player here, the video must be uploaded as a GitHub attachment and the README updated with the attachment URL.
+![](https://github.com/user-attachments/assets/2979fb63-2aec-4ca4-9a07-991ea99a8336)
 
 ## Why this project
 
