@@ -8,7 +8,7 @@
 
 Take a two-minute walkthrough of Multimodal RAG Core:
 
-![](https://github.com/user-attachments/assets/2979fb63-2aec-4ca4-9a07-991ea99a8336)
+https://github.com/user-attachments/assets/2979fb63-2aec-4ca4-9a07-991ea99a8336
 
 ## Why this project
 
