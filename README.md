@@ -1,8 +1,22 @@
 # Multimodal RAG Core
 
-> A production-oriented, multilingual document intelligence application. Upload a document, ask a question, and receive grounded answers from the content of that conversation.
+**A production-deployed, multilingual document Q&A application.** Multimodal RAG Core combines a Next.js interface with a FastAPI retrieval pipeline so users can ask grounded questions about documents in English or Arabic.
 
-**Multimodal RAG Core** combines a Next.js client with a FastAPI retrieval pipeline to deliver secure, conversation-scoped document Q&A. The interface and generated responses are designed for Arabic and English workflows.
+It was built around practical engineering concerns: conversation-scoped document isolation, source-aware answers, encrypted user-managed model keys, and production operations with PostgreSQL, Redis, and Docker.
+
+## At a glance
+
+- **Grounded document Q&A:** retrieves relevant passages and returns source metadata, including filenames and page references.
+- **Multimodal input:** supports PDF, text, Markdown, and common image formats, including image-based questions and optional OCR.
+- **Conversation isolation:** each user's conversations have independent document stores.
+- **Flexible model configuration:** Gemini or OpenRouter, with encrypted per-user API keys and provider/model selection.
+- **Production safeguards:** Google sign-in, JWT access and refresh tokens, ownership checks, rate limits, health/readiness endpoints, and production configuration validation.
+
+## Production usage evidence
+
+The screenshot below captures a query against the deployed PostgreSQL database. At the time it was captured, the `chat_messages` table contained **138 user messages from 43 distinct users who had sent a message**. This demonstrates recorded use of the deployed application; it does not by itself establish user retention, satisfaction, or broader impact.
+
+![Production PostgreSQL query showing 43 distinct users and 138 user messages](assets/Multi-Model-RAG.png)
 
 ## Demo
 
@@ -10,140 +24,127 @@ Take a two-minute walkthrough of Multimodal RAG Core:
 
 https://github.com/user-attachments/assets/2979fb63-2aec-4ca4-9a07-991ea99a8336
 
-## Why this project
-
-- **Grounded answers** — retrieves relevant passages before asking the model to answer, with filename and page references returned alongside the response.
-- **Strict data isolation** — every user and conversation has an independent document store; uploads never cross conversation boundaries.
-- **Multimodal input** — supports PDFs, text, Markdown, and common image formats, as well as image-based questions.
-- **Bring your own key** — users can securely save and enable their own Google Gemini or OpenRouter API key from Model Settings.
-- **Production safeguards** — Google sign-in, JWT access and refresh tokens, rate limits, encrypted provider keys, health checks, PostgreSQL, Redis, Docker, and explicit production validation.
-
 ## Product flow
 
 ```text
 Sign in with Google
-       ↓
+       |
+       v
 Create or select a conversation
-       ↓
+       |
+       v
 Upload documents / ask a question
-       ↓
+       |
+       v
 Extract, chunk, and retrieve relevant content
-       ↓
+       |
+       v
 Generate an answer with source metadata
 ```
 
-Each Google account receives one server-provided free question. Additional usage requires the user to configure their own supported API key.
+Each Google account receives one server-provided free question. Further usage requires the user to configure a supported API key.
 
 ## Architecture
 
 ```text
-┌───────────────────────────────────────────────┐
-│ Next.js 15 + React 19 frontend                 │
-│ Google OAuth · conversations · model settings  │
-└───────────────────────┬───────────────────────┘
-                        │ HTTPS / JWT
-┌───────────────────────▼───────────────────────┐
-│ FastAPI application                            │
-│ auth · uploads · chat · provider configuration │
-└───────┬───────────────────────┬───────────────┘
-        │                       │
-┌───────▼────────┐     ┌────────▼──────────────┐
-│ PostgreSQL      │     │ Conversation RAG store │
-│ users/sessions  │     │ SQLite + FAISS         │
-└────────────────┘     └────────┬──────────────┘
-                                 │
-                   ┌─────────────▼─────────────┐
-                   │ Gemini or OpenRouter model │
-                   └───────────────────────────┘
+Next.js 15 + React 19
+Google OAuth / conversations / model settings
+                 | HTTPS / JWT
+                 v
+FastAPI application -------- PostgreSQL
+auth / uploads / chat        users / sessions / chat history
+        |
+        +-- Conversation-scoped RAG data
+        |   SQLite chunks + FAISS vector index
+        +-- Redis (caching / rate limiting)
+        +-- Gemini or OpenRouter model
 ```
 
-Conversation data is persisted independently at:
+Conversation data is stored independently for each user and conversation:
 
 ```text
 <UPLOAD_DIR>/<user_id>/conversations/<conversation_id>/
-├── uploads/
-├── rag.sqlite3
-└── faiss_index/                 # vector search index
++-- uploads/
++-- rag.sqlite3
++-- faiss_index/                 # vector search index
 ```
 
-## Core capabilities
+In production, PostgreSQL stores users, sessions, and chat history; uploaded files and conversation RAG stores use the persistent backend data volume.
 
-| Area | Details |
+## Features and stack
+
+| Area | Implementation |
 | --- | --- |
-| Authentication | Google OAuth with JWT access and refresh tokens |
-| Conversations | Saved history, isolated documents, and per-conversation retrieval |
-| Files | PDF, TXT, Markdown, PNG, JPG/JPEG, TIFF, BMP, and GIF |
-| Extraction | PDF text extraction and optional Tesseract OCR for images |
-| Retrieval | SQLite-backed chunks with FAISS vector search |
-| Models | Google Gemini and OpenRouter; text and image prompts |
-| User model settings | Encrypted, per-user API keys with provider/model selection and enablement |
-| Operational safety | File-size cap, rate limits, ownership checks, readiness and metrics endpoints |
-
-> Uploads and image-question attachments are capped at **2 MB** by design.
-
-## Technology
-
-| Layer | Stack |
-| --- | --- |
-| Web client | Next.js 15, React 19, TypeScript, Lucide |
-| API | FastAPI, Uvicorn/Gunicorn, Pydantic |
-| Persistence | PostgreSQL in production; SQLite for RAG data |
-| Caching / rate limiting | Redis |
-| Retrieval | LangChain, FAISS, sentence-transformers |
+| Authentication | Google OAuth; JWT access and refresh tokens |
+| Conversations | Saved history, ownership checks, isolated documents, per-conversation retrieval |
+| Files | PDF, TXT, Markdown, PNG, JPG/JPEG, TIFF, BMP, GIF; 2 MB upload and image-attachment cap |
+| Extraction | PDF text extraction; optional Tesseract OCR for images |
+| Retrieval | SQLite-backed chunks, LangChain, FAISS, sentence-transformers |
 | Document processing | pypdf, Pillow, optional Tesseract OCR |
-| AI providers | Google Gen AI SDK and OpenRouter API |
-| Deployment | Docker Compose and Railway-compatible configuration |
+| Models | Google Gemini and OpenRouter; text and image prompts |
+| User model settings | Encrypted per-user API keys, provider/model selection, and enablement |
+| API / frontend | FastAPI, Uvicorn/Gunicorn, Pydantic; Next.js 15, React 19, TypeScript, Lucide |
+| Operations | PostgreSQL, Redis, Docker Compose, Railway-compatible configuration; health, readiness, and metrics endpoints |
 
-## Repository layout
+## Production deployment
 
-```text
-.
-├── backend/
-│   ├── app.py                 # FastAPI routes and API orchestration
-│   ├── config.py              # environment, validation, provider settings
-│   ├── rag_core.py            # ingestion, retrieval, and answer generation
-│   ├── llm_provider.py        # Gemini and OpenRouter adapters
-│   ├── database.py            # SQLAlchemy database setup
-│   └── requirements.txt
-├── frontend/                  # Next.js application
-├── tests/                     # API, RAG, security, and scale tests
-├── docker/                    # backend image and container entrypoint
-├── docker-compose.yml         # local production-like services
-├── docker-compose.production.yml
-├── run.py                     # local development launcher
-└── .env.example               # environment template
+The application is currently hosted on Railway. Availability may be temporary.
+
+- **Frontend:** [Open the deployed application](https://multimodal-rag-core-production-4615.up.railway.app/)
+- **Backend/API:** the public URL is not stored in this repository. Set `NEXT_PUBLIC_API_URL` to the deployed backend's public HTTPS URL.
+
+The documented Railway setup uses four services: **backend**, **frontend**, **PostgreSQL**, and **Redis**.
+
+| Service | Railway configuration |
+| --- | --- |
+| Backend | Root `/`; Dockerfile `docker/Dockerfile`; health check `/health` |
+| Frontend | Root `/frontend`; build `npm run build`; start `npm start` |
+| PostgreSQL / Redis | Railway-managed services with referenced variables |
+
+Attach a persistent backend volume at `/app/data` for uploads, SQLite RAG stores, and FAISS indexes. The Railway entrypoint runs `alembic upgrade head` before the API starts. Rebuild the frontend after changing `NEXT_PUBLIC_API_URL`, which Next.js exposes at build time. Set `ALLOWED_ORIGINS` to the exact public frontend origin. Complete Google OAuth client ID and origin/redirect configuration once both public URLs are available; no redirect URI is assumed here.
+
+Docker Compose also provides a production-like local setup:
+
+```bash
+docker compose up --build
+docker compose -f docker-compose.production.yml up -d --build
 ```
 
-## Quick start
+Production requires PostgreSQL, Redis, a unique JWT secret of at least 32 characters, a valid Fernet provider-encryption key, and safe CORS origins. The backend validates these settings at startup.
+
+The private `GET /metrics` endpoint reports aggregate production usage without message content or provider secrets. Configure `ADMIN_METRICS_TOKEN` in Railway and pass it in the `X-Metrics-Token` header; do not commit it or put it in a URL. User records include `created_at`, `last_login_at`, `last_seen_at`, and `login_count`.
+
+For example, from Git Bash:
+
+```bash
+curl -H "X-Metrics-Token: $ADMIN_METRICS_TOKEN" <RAILWAY_BACKEND_HTTPS_URL>/metrics
+```
+
+## Run locally
 
 ### Prerequisites
 
 - Python 3.10+
 - Node.js 18.18+ and npm
-- A Google OAuth Web Client ID
-- A Gemini or OpenRouter API key for the server-provided free question
-- Tesseract, only when image OCR is required
+- Google OAuth Web Client ID
+- Gemini or OpenRouter API key for the server-provided free question
+- Tesseract only if image OCR is needed
 
-### 1. Install dependencies
+### Install
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-
 pip install -r backend/requirements.txt
-pip install -r requirements-dev.txt  # optional: test and load-test tooling
-
+pip install -r requirements-dev.txt  # optional test and load-test tooling
 cd frontend
 npm install
 cd ..
 ```
 
-### 2. Configure the environment
-
-Copy `.env.example` to `backend/.env`. This file is ignored by Git and must never be committed.
+Copy `.env.example` to `backend/.env` (never commit it):
 
 ```dotenv
-# backend/.env
 APP_ENV=development
 GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-web-client-id.apps.googleusercontent.com
 GOOGLE_API_KEY=your-server-gemini-api-key
@@ -154,16 +155,16 @@ USE_VECTOR_DB=true
 ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```
 
-Create `frontend/.env.local` for browser-visible variables:
+Create `frontend/.env.local`:
 
 ```dotenv
 NEXT_PUBLIC_API_URL=http://localhost:8000
 NEXT_PUBLIC_GOOGLE_OAUTH_CLIENT_ID=your-google-oauth-web-client-id.apps.googleusercontent.com
 ```
 
-The Google OAuth client ID must match in both files. For OpenRouter as the server provider, set `LLM_PROVIDER=openrouter`, `OPENROUTER_API_KEY`, and `OPENROUTER_MODEL` instead.
+Use the same OAuth client ID in both files. To use OpenRouter as the server provider, set `LLM_PROVIDER=openrouter`, `OPENROUTER_API_KEY`, and `OPENROUTER_MODEL`.
 
-### 3. Run locally
+### Start
 
 From the repository root:
 
@@ -171,10 +172,10 @@ From the repository root:
 python run.py
 ```
 
-Or run the services separately:
+Or run the API and frontend separately:
 
 ```powershell
-# terminal 1
+# terminal 1, from repository root
 .\.venv\Scripts\python.exe -m uvicorn backend.app:app --host 127.0.0.1 --port 8000
 
 # terminal 2
@@ -182,116 +183,44 @@ cd frontend
 npm run dev
 ```
 
-Open the application at `http://localhost:3000`.
+Open `http://localhost:3000`. API endpoints: health at `/health`, readiness at `/ready`, interactive docs at `/docs`, and metrics at `/metrics` (all on port 8000).
 
-| Service | URL |
-| --- | --- |
-| Frontend | `http://localhost:3000` |
-| API health | `http://localhost:8000/health` |
-| API readiness | `http://localhost:8000/ready` |
-| API documentation | `http://localhost:8000/docs` |
-| Metrics | `http://localhost:8000/metrics` |
+Recommended release checks: confirm `/health` and `/ready`, sign in with Google, upload a small PDF or text file and ask a grounded question, check that citations match the filename and page, and verify that production CORS allows only the public frontend origin.
 
-## Model providers and user API keys
+## Repository layout
 
-The application can use a server-configured provider for the initial free question. To continue, users open **Model Settings**, choose **Google Gemini** or **OpenRouter**, enter an API key, select a model, enable that provider, and save.
-
-Provider keys are encrypted before being stored. A user key takes precedence over the server default for that user; users can update the key or choose another supported provider later.
-
-## Deployment
-
-### Docker Compose
-
-Docker Compose runs the API with PostgreSQL and Redis. The Next.js frontend is deployed separately, or started locally, and must receive the public backend URL through `NEXT_PUBLIC_API_URL`.
-
-```bash
-docker compose up --build
-docker compose -f docker-compose.production.yml up -d --build
+```text
+backend/                 # FastAPI routes, configuration, RAG pipeline, providers, database
+frontend/                # Next.js application
+tests/                   # API, RAG, security, and scale tests
+docker/                  # backend image and container entrypoint
+alembic/                 # database migrations
+docker-compose*.yml       # local and production-like services
+run.py                    # local development launcher
+.env.example              # environment template
 ```
 
-Before production, set at least:
-
-```dotenv
-APP_ENV=production
-DATABASE_URL=postgresql+psycopg://...
-REDIS_URL=redis://...
-JWT_SECRET_KEY=<unique secret of at least 32 characters>
-PROVIDER_ENCRYPTION_KEY=<valid Fernet key>
-ALLOWED_ORIGINS=https://your-frontend.example.com
-```
-
-The backend fails fast in production when PostgreSQL, Redis, a valid Fernet key, a strong JWT secret, or safe CORS origins are missing.
-
-### Railway
-
-Create four Railway services: **backend**, **frontend**, **PostgreSQL**, and **Redis**.
-
-| Service | Configuration |
-| --- | --- |
-| Backend | Root directory `/`; Dockerfile `docker/Dockerfile`; health check `/health` |
-| Frontend | Root directory `/frontend`; build `npm run build`; start `npm start` |
-| PostgreSQL / Redis | Use Railway-managed services and reference variables |
-
-Attach a persistent backend volume at `/app/data` to retain uploaded files, SQLite RAG stores, and FAISS indexes. Chat history is stored in PostgreSQL in production, so it remains available after backend restarts and new deployments. `NEXT_PUBLIC_API_URL` must point to the public Backend/API HTTPS URL. Configure `ALLOWED_ORIGINS` with the exact public Frontend HTTPS origin. Rebuild the frontend after changing `NEXT_PUBLIC_API_URL` because Next.js exposes it at build time.
-
-### Current hosted deployment
-
-**Public Frontend URL:** [Open the deployed application](https://multimodal-rag-core-production-4615.up.railway.app/)
-
-**Public Backend/API URL:** `<RAILWAY_BACKEND_HTTPS_URL>`
-
-> Currently hosted on Railway. Availability may be temporary.
-
-The exact production Backend/API URL is not stored in this repository. After the Railway backend service is deployed, use its public HTTPS URL for `NEXT_PUBLIC_API_URL`; use the exact public Frontend HTTPS origin for `ALLOWED_ORIGINS`. The Google OAuth Client ID and origin/redirect configuration can be completed after both production URLs are available; no redirect URI is assumed here.
-
-### Usage evidence
-
-The private `GET /metrics` endpoint reports persistent production usage data without exposing message content or provider secrets. Configure `ADMIN_METRICS_TOKEN` in Railway and send it as the `X-Metrics-Token` header; never commit or place this token in a URL.
-
-- `total_users` — registered users
-- `users_with_login` — users who have completed a login
-- `active_users_24h` — users seen during the last 24 hours
-- `conversations` and `messages` — stored chat activity
-
-User records also keep `created_at`, `last_login_at`, `last_seen_at`, and `login_count`. The Railway entrypoint runs `alembic upgrade head` before starting the API, so these fields are migrated automatically.
-
-From Git Bash, retrieve the private report with:
-
-```bash
-curl -H "X-Metrics-Token: $ADMIN_METRICS_TOKEN" <RAILWAY_BACKEND_HTTPS_URL>/metrics
-```
-
-## Verification and testing
+## Verification
 
 ```powershell
-# backend tests
 python -m pytest tests -q
-
-# frontend production build
 cd frontend
 npm run build
+```
 
-# optional load test (start the backend first)
+Optional load test, with the backend running:
+
+```powershell
 locust -f tests/load/locustfile.py --host http://localhost:8000
 ```
 
-Recommended release checks:
+## Security notes
 
-1. Confirm `/health` and `/ready` return successfully.
-2. Sign in through Google OAuth.
-3. Upload a small PDF or text document and ask a grounded question.
-4. Verify that returned citations match the uploaded filename and page.
-5. Confirm the public frontend origin is the only allowed browser origin.
-
-## Security and operational notes
-
-- Never commit `.env`, `.env.local`, API keys, uploads, databases, or vector indexes.
-- Rotate a key immediately if it appears in a commit, terminal capture, screenshot, or chat.
-- Use HTTPS and exact origins in `ALLOWED_ORIGINS` for every production environment.
-- Keep PostgreSQL, Redis, and the `/app/data` volume backed up according to your retention policy.
-- API routes verify that the authenticated user owns the relevant conversation and document.
-- The built-in upload limit is intentionally capped at 2 MB, even if an environment value is higher.
+- Never commit environment files, API keys, uploads, databases, or vector indexes. Rotate a key if it appears in a commit, terminal capture, screenshot, or chat.
+- Use HTTPS and exact origins in `ALLOWED_ORIGINS` in production.
+- Back up PostgreSQL, Redis, and the `/app/data` volume according to your retention policy.
+- Authenticated API routes check ownership of conversations and documents. The upload limit is intentionally capped at 2 MB, even if an environment setting is higher.
 
 ## License
 
-Licensed under the MIT License.
+MIT License.
